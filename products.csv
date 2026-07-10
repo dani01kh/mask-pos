@@ -1,0 +1,3 @@
+product_name,category,brand,size,color,sell_price,stock_qty,barcode,low_stock_level
+Tshirt,Clothes,,M,Black,15.00,10,V000001,3
+Tshirt,Clothes,,L,Black,15.00,5,V000002,3

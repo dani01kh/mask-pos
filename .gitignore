@@ -1,0 +1,56 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+venv/
+venv32/
+.venv/
+
+# IDE / local agent state
+.idea/
+.vscode/
+.agents/
+
+# Build and packaged output
+build/
+dist/
+dist_build_auto_send/
+package_runtime/
+package_runtime32/
+cloudflare-pos-api/.wrangler/
+*.spec~
+*.zip
+*.exe
+*.dll
+*.lnk
+
+# Runtime data and generated business output
+*.db
+*.sqlite
+*.sqlite3
+*.lock
+data/
+backups/
+reports/
+receipts/
+server.log
+server.stdout.log
+server.stderr.log
+pos_error.log
+*.log
+
+# Local/private configuration
+pos_config.json
+cloudflare_pos_config.json
+cloud_sync_device.json
+config.json
+
+# OS noise
+Thumbs.db
+Desktop.ini
