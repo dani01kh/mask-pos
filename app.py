@@ -389,8 +389,10 @@ except ModuleNotFoundError:
         return create_temp_receipt_pdf(lines, title=title)
     del _rl_canvas, _rl_letter, _rl_mm, _tmp, _os
 from barcodes_pdf import make_labels_pdf
+import app_update
 
 APP_TITLE = "Mask POS"
+APP_VERSION = app_update.current_version()
 CHROME_PATH = r"C:\Program Files\Google\Chrome\Application\chrome.exe"
 
 
@@ -1321,6 +1323,8 @@ class MaskPOS(tk.Tk):
         self._daily_report_email_last_attempt_ts = 0.0
         self._daily_report_email_sending = False
         self.after(5000, self._daily_report_email_tick)
+        self._update_check_running = False
+        self.after(15000, lambda: self.check_for_app_update(silent=True))
 
     def toggle_fullscreen(self):
         try:
@@ -1714,6 +1718,134 @@ class MaskPOS(tk.Tk):
             self.destroy()
         except Exception:
             pass
+
+    def check_for_app_update(self, silent=False, status_var=None):
+        if getattr(self, "_update_check_running", False):
+            return
+        self._update_check_running = True
+        if status_var is not None:
+            try:
+                status_var.set("Checking for updates...")
+            except Exception:
+                pass
+
+        def worker():
+            try:
+                info = app_update.check_for_update()
+                err = None
+            except Exception as exc:
+                info = None
+                err = exc
+
+            def finish():
+                self._update_check_running = False
+                if err is not None:
+                    if status_var is not None:
+                        status_var.set(f"Update check failed: {err}")
+                    elif not silent:
+                        messagebox.showwarning("App update", f"Could not check for updates.\n{err}")
+                    return
+
+                if not info or not info.get("available"):
+                    msg = f"Mask POS is up to date. Current version: {APP_VERSION}."
+                    if status_var is not None:
+                        status_var.set(msg)
+                    elif not silent:
+                        messagebox.showinfo("App update", msg)
+                    return
+
+                text = app_update.describe_update(info)
+                if status_var is not None:
+                    status_var.set(f"Update available: v{info.get('version')}.")
+                if messagebox.askyesno("App update available", text + "\n\nDownload and install now?"):
+                    self._download_and_install_update(info, status_var=status_var)
+
+            try:
+                self.after(0, finish)
+            except Exception:
+                pass
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _download_and_install_update(self, info, status_var=None):
+        if not getattr(sys, "frozen", False):
+            messagebox.showinfo(
+                "App update",
+                "The updater is ready, but automatic install only runs from the packaged Mask POS app.\n\n"
+                "After you manually install the next packaged version, future updates can install from inside the app."
+            )
+            return
+
+        def set_status(text):
+            if status_var is not None:
+                try:
+                    status_var.set(text)
+                except Exception:
+                    pass
+
+        def progress(done, total):
+            if total:
+                pct = int((done / max(1, total)) * 100)
+                try:
+                    self.after(0, lambda: set_status(f"Downloading update... {pct}%"))
+                except Exception:
+                    pass
+            else:
+                mb = done / (1024 * 1024)
+                try:
+                    self.after(0, lambda: set_status(f"Downloading update... {mb:.1f} MB"))
+                except Exception:
+                    pass
+
+        def worker():
+            try:
+                zip_path = app_update.download_update(info, progress=progress)
+            except Exception as exc:
+                try:
+                    self.after(0, lambda: messagebox.showwarning("App update", f"Download failed.\n{exc}"))
+                    self.after(0, lambda: set_status(f"Download failed: {exc}"))
+                except Exception:
+                    pass
+                return
+
+            def install_now():
+                if not messagebox.askyesno(
+                    "Install update",
+                    "The update has downloaded.\n\nMask POS will close, install the update, and reopen. Continue?"
+                ):
+                    set_status("Update downloaded but not installed.")
+                    return
+                try:
+                    set_status("Installing update...")
+                    app_update.launch_installer(
+                        zip_path,
+                        BASE_DIR,
+                        restart_exe=sys.executable,
+                        parent_pid=os.getpid(),
+                    )
+                    try:
+                        stop_backend()
+                    except Exception:
+                        pass
+                    try:
+                        backup_pos_db()
+                    except Exception:
+                        pass
+                    try:
+                        _release_single_instance()
+                    except Exception:
+                        pass
+                    os._exit(0)
+                except Exception as exc:
+                    messagebox.showwarning("App update", f"Could not start installer.\n{exc}")
+                    set_status(f"Install failed: {exc}")
+
+            try:
+                self.after(0, install_now)
+            except Exception:
+                pass
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def _check_unclosed_shift(self):
         """On launch: if a previous shift is still open (e.g., crash), force a cashier-proof decision."""
@@ -11880,6 +12012,38 @@ class SettingsPage(tk.Frame):
         tk.Label(
             body.inner,
             text="Local auto-backup runs on startup, every six hours, when you close the register, and when you exit. Add a Google Drive target to upload the same verified snapshot off-site.",
+            font=UI.FONT_SM,
+            bg=UI.CARD,
+            fg=UI.MUTED,
+            wraplength=720,
+            justify="left",
+        ).pack(anchor="w", pady=(6, 0))
+
+        # -------- App Updates --------
+        tk.Label(body.inner, text="App Updates", font=UI.FONT_MD, bg=UI.CARD, fg=UI.TEXT).pack(anchor="w", pady=(18, 6))
+        update_row = tk.Frame(body.inner, bg=UI.CARD)
+        update_row.pack(anchor="w", fill="x")
+        self.update_status_var = tk.StringVar(value=f"Current version: {APP_VERSION}.")
+
+        def _check_updates_clicked():
+            try:
+                self.winfo_toplevel().check_for_app_update(silent=False, status_var=self.update_status_var)
+            except Exception as e:
+                self.update_status_var.set(f"Update check failed: {e}")
+
+        ttk.Button(update_row, text="Check for Updates", command=_check_updates_clicked).pack(side="left")
+        tk.Label(
+            update_row,
+            textvariable=self.update_status_var,
+            font=UI.FONT_SM,
+            bg=UI.CARD,
+            fg=UI.MUTED,
+            wraplength=560,
+            justify="left",
+        ).pack(side="left", padx=(10, 0))
+        tk.Label(
+            body.inner,
+            text="Updates come from GitHub Releases. Install this updater version manually once; future packaged releases can download here, close the POS, update app files, and reopen without touching your database or settings.",
             font=UI.FONT_SM,
             bg=UI.CARD,
             fg=UI.MUTED,

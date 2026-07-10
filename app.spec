@@ -78,6 +78,7 @@ hiddenimports += [
     "uvicorn.main",
     "uvicorn.config",
     "uvicorn.server",
+    "app_update",
     "server",
     "daily_report",
     "supabase_sync",
@@ -90,13 +91,9 @@ hiddenimports += [
 # -------------------------------------------------
 runtime_files = [
     "daily_report.py",
-    "pos.db",
-    "pos_config.json",
-    "config.json",
     "products.csv",
     "SumatraPDF.exe",
     "SumatraPDF-settings.txt",
-    "cloudflare_pos_config.json",
 ]
 
 for f in runtime_files:
