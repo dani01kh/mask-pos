@@ -133,6 +133,7 @@ def _fetch_rows(db_path: str, start: datetime, end: datetime) -> dict:
         sql_out = "'OUT'"
 
         created_expr = _expr(sales_cols, "s", "created_at", sql_empty)
+        sales_void_filter = "AND COALESCE(s.is_voided, 0) = 0" if "is_voided" in sales_cols else ""
         sales_select = [
             "s.id AS id",
             f"{created_expr} AS created_at",
@@ -154,6 +155,7 @@ def _fetch_rows(db_path: str, start: datetime, end: datetime) -> dict:
             FROM sales s
             WHERE datetime({created_expr}) >= datetime(?)
               AND datetime({created_expr}) < datetime(?)
+              {sales_void_filter}
             ORDER BY datetime({created_expr}) ASC, s.id ASC
             """,
             (start_sql, end_sql),
@@ -184,6 +186,7 @@ def _fetch_rows(db_path: str, start: datetime, end: datetime) -> dict:
             LEFT JOIN products p ON p.id = si.product_id
             WHERE datetime({item_created_expr}) >= datetime(?)
               AND datetime({item_created_expr}) < datetime(?)
+              {sales_void_filter}
             ORDER BY datetime({item_created_expr}) ASC, si.sale_id ASC, si.id ASC
             """,
             (start_sql, end_sql),

@@ -31,7 +31,8 @@ $protectedFiles = @(
     "cloudflare_pos_config.json",
     "cloud_sync_device.json",
     "config.json",
-    "maskpos.lock"
+    "maskpos.lock",
+    "cashier_recovery.json"
 )
 $protectedDirs = @("backups", "data", "receipts", "reports", "__pycache__")
 

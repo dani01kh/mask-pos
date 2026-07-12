@@ -295,7 +295,8 @@ from backend import (
     cloud_sync_now,
     connection_role, is_connected, last_ok_age_seconds, stop_backend,
     add_product, find_product_by_barcode, adjust_stock,
-    list_products, update_product, create_sale, get_sale_receipt_data,
+    list_products, update_product, update_product_details, list_inventory_movements,
+    create_sale, get_sale_receipt_data,
     delete_product,
     _range_bounds,
     analytics_kpis_range,
@@ -303,15 +304,17 @@ from backend import (
     analytics_series_in_range,
     analytics_top_products_range,
     analytics_low_stock,
+    data_health_summary,
     # shifts and employees
     list_employees, ensure_employee, deactivate_employee,
     employee_pin_required, verify_employee_pin,
     get_open_shift, get_last_closed_shift, open_shift, close_shift, close_shift_with_cash_takeout, shift_summary, list_shifts, reset_next_shift_number,
     record_cash_movement, list_cash_movements,
-    list_sales_for_day, get_sale_detail, get_sale_detail_with_returns,
+    list_sales_for_day, search_sales, list_product_sales, list_product_price_history,
+    reorder_suggestions, analytics_discount_impact, get_sale_detail, get_sale_detail_with_returns,
     get_sale_by_receipt_scan, create_return, list_returns_for_sale,
     create_bon, get_bon_by_code, list_bons, void_bon,
-    delete_sale,
+    delete_sale, void_sale,
     backup_pos_db, open_backups_folder, get_backup_config, set_backup_rclone_remote,
     list_printers,
     clear_printer_queue,
@@ -356,6 +359,12 @@ from backend import (
     clear_bundle_offers,
     get_spin_wheel_prizes,
     set_spin_wheel_prizes,
+    get_distinct_categories,
+    get_data_health_stats,
+    list_health_issues,
+    bulk_update_products,
+    repair_broken_product_links,
+    recreate_and_repair_product,
 )
 
 try:
@@ -1414,6 +1423,7 @@ class MaskPOS(tk.Tk):
             "ReturnsPage": lambda: ReturnsPage(self.content_scroll_inner, cashier_page=self.cashier_page),
             "OffersPage": lambda: OffersPage(self.content_scroll_inner),
             "SettingsPage": lambda: SettingsPage(self.content_scroll_inner),
+            "DataHealthPage": lambda: DataHealthPage(self.content_scroll_inner),
         }
         self._page_attrs = {
             "ProductsPage": "products_page",
@@ -1424,6 +1434,7 @@ class MaskPOS(tk.Tk):
             "ReturnsPage": "returns_page",
             "OffersPage": "offers_page",
             "SettingsPage": "settings_page",
+            "DataHealthPage": "data_health_page",
         }
 
         for p in self.pages.values():
@@ -1484,6 +1495,7 @@ class MaskPOS(tk.Tk):
             ("🔁", "Returns / Exchange", "ReturnsPage"),
             ("📦", "Products", "ProductsPage"),
             ("🏷", "Barcodes", "BarcodesPage"),
+            ("🩺", "Data Health", "DataHealthPage"),
             ("📈", "Analytics", "AnalyticsPage"),
             ("⚙️", "Settings", "SettingsPage"),
         ]
@@ -2230,6 +2242,21 @@ class MaskPOS(tk.Tk):
         key = event.keysym
         ch = event.char or ""
 
+        if key == "F1":
+            try:
+                self.cashier_page.show_shortcut_help()
+            except Exception:
+                pass
+            return "break"
+
+        if key.lower() == "z" and (int(getattr(event, "state", 0) or 0) & 0x4):
+            if getattr(self, "_active_page", "") == "CashierPage":
+                try:
+                    self.cashier_page.undo_last_cart_action()
+                except Exception:
+                    pass
+                return "break"
+
         # --- Keyboard-first Cash Register shortcuts (only when on CashierPage) ---
         try:
             if getattr(self, "_active_page", "") == "CashierPage" and hasattr(self, "cashier_page"):
@@ -2365,6 +2392,10 @@ class CashierPage(tk.Frame):
         self.cart_lines = []
         self.held_orders = []
         self._held_order_seq = 1
+        self._cashier_recovery_path = Path(data_path("cashier_recovery.json"))
+        self._recovered_cart = False
+        self._undo_stack = []
+        self._pending_scan_qty = 1
         pending_credit = _load_pending_exchange_credit()
         self.exchange_credit = float(pending_credit.get("amount") or 0.0)
         self.exchange_origin_sale_ids = list(pending_credit.get("origin_sale_ids") or [])
@@ -2383,7 +2414,103 @@ class CashierPage(tk.Frame):
         self._primary_enabled_requested = True
         self._primary_label = "Checkout"
         self._primary_cmd = self.checkout
+        self._load_cashier_recovery()
         self._build()
+        self.refresh_cart()
+        self._update_held_order_button()
+        if self._recovered_cart:
+            self.after(350, lambda: messagebox.showinfo(
+                "Cart recovered",
+                "The unfinished cart from the previous session was restored.",
+                parent=self,
+            ))
+
+    def _load_cashier_recovery(self):
+        try:
+            raw = json.loads(self._cashier_recovery_path.read_text(encoding="utf-8"))
+        except Exception:
+            return
+        try:
+            active = raw.get("active_cart") or {}
+            lines = [dict(x) for x in (active.get("lines") or []) if isinstance(x, dict)]
+            lines = [x for x in lines if int(x.get("qty") or 0) > 0][:250]
+            self.cart_lines = lines
+            self._recovered_cart = bool(lines)
+            self._wheel_prize_claimed = bool(active.get("wheel_prize_claimed", False))
+            self._wheel_discount_pct = float(active.get("wheel_discount_pct") or 0.0)
+            self._wheel_receipt_label = str(active.get("wheel_receipt_label") or "")
+
+            held = []
+            for raw_order in (raw.get("held_orders") or [])[:50]:
+                if not isinstance(raw_order, dict):
+                    continue
+                order = dict(raw_order)
+                order["lines"] = [dict(x) for x in (order.get("lines") or []) if isinstance(x, dict)][:250]
+                if order["lines"]:
+                    held.append(order)
+            self.held_orders = held
+            highest = max([int(x.get("id") or 0) for x in held] or [0])
+            self._held_order_seq = max(highest + 1, int(raw.get("next_held_order_id") or 1))
+        except Exception:
+            self.cart_lines = []
+            self.held_orders = []
+            self._held_order_seq = 1
+            self._recovered_cart = False
+
+    def _save_cashier_recovery(self, include_active=True):
+        active = {
+            "lines": copy.deepcopy(self.cart_lines) if include_active else [],
+            "wheel_prize_claimed": bool(getattr(self, "_wheel_prize_claimed", False)) if include_active else False,
+            "wheel_discount_pct": float(getattr(self, "_wheel_discount_pct", 0.0) or 0.0) if include_active else 0.0,
+            "wheel_receipt_label": str(getattr(self, "_wheel_receipt_label", "") or "") if include_active else "",
+        }
+        payload = {
+            "version": 1,
+            "saved_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "active_cart": active,
+            "held_orders": copy.deepcopy(self.held_orders),
+            "next_held_order_id": int(self._held_order_seq or 1),
+        }
+        path = self._cashier_recovery_path
+        tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+            os.replace(tmp, path)
+        except Exception:
+            try:
+                tmp.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+    def _update_held_order_button(self):
+        button = getattr(self, "_btn_held_orders", None)
+        if button is not None:
+            count = len(getattr(self, "held_orders", []) or [])
+            button.config(text=(f"Held Orders ({count})" if count else "Held Orders"))
+
+    def _remember_cart_state(self):
+        snapshot = copy.deepcopy(self.cart_lines)
+        if not self._undo_stack or self._undo_stack[-1] != snapshot:
+            self._undo_stack.append(snapshot)
+            del self._undo_stack[:-20]
+
+    def undo_last_cart_action(self):
+        if not self._undo_stack:
+            messagebox.showinfo("Undo", "There is no cart change to undo.", parent=self)
+            return
+        self.cart_lines = self._undo_stack.pop()
+        self.refresh_cart()
+        self.refresh_picker()
+
+    def show_shortcut_help(self):
+        messagebox.showinfo(
+            "Cash Register Shortcuts",
+            "F1  Show this help\nCtrl+Z  Undo last cart change\n+ / -  Change selected quantity\n"
+            "Delete  Remove selected item\nEnter  Continue checkout\nEscape  Cancel/back\n\n"
+            "Smart quantity: type 5* and press Enter, then scan the product.",
+            parent=self,
+        )
 
     def _build(self):
 
@@ -2485,6 +2612,7 @@ class CashierPage(tk.Frame):
         self.tree.column("subtotal", width=118, minwidth=92, anchor="e", stretch=False)
         self.tree.tag_configure("odd", background=UI.SURFACE)
         self.tree.tag_configure("even", background=UI.CARD)
+        self.tree.tag_configure("discounted", foreground="#047857")
 
         cart_scroll = ttk.Scrollbar(cart_table, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=cart_scroll.set)
@@ -2667,12 +2795,14 @@ class CashierPage(tk.Frame):
         self._btn_held_orders = GhostButton(left_actions, "Held Orders", self.open_held_orders)
         self._btn_load_bon = GhostButton(left_actions, "Load Bon", self.open_bon_popup)
         self._btn_spin_wheel = GhostButton(left_actions, "Spin Wheel", self.open_spin_wheel)
+        self._btn_undo = GhostButton(left_actions, "Undo", self.undo_last_cart_action)
         self._btn_clear_cart = GhostButton(left_actions, "Clear Cart", self.clear_cart)
         self._btn_line_disc.pack(side="left")
         self._btn_hold_order.pack(side="left", padx=(12, 0))
         self._btn_held_orders.pack(side="left", padx=(12, 0))
         self._btn_load_bon.pack(side="left", padx=(12, 0))
         self._btn_spin_wheel.pack(side="left", padx=(12, 0))
+        self._btn_undo.pack(side="left", padx=(12, 0))
         self._btn_clear_cart.pack(side="left", padx=(12, 0))
 
         self.checkout_amount_lbl = tk.Label(
@@ -3218,6 +3348,7 @@ class CashierPage(tk.Frame):
         name_clean = str(name).strip()
         price_val = float(price)
         bc = normalize_item_barcode(barcode or "")
+        self._remember_cart_state()
 
         for line in self.cart_lines:
             if (line.get("product_id") is None) or bool(line.get("is_quick", False)):
@@ -3238,6 +3369,7 @@ class CashierPage(tk.Frame):
             "product_id": None,
             "name": name_clean,
             "price": price_val,
+            "original_price": price_val,
             "qty": 1,
             "discount_pct": 0.0,
             "barcode": bc or None,
@@ -3378,7 +3510,18 @@ class CashierPage(tk.Frame):
             top._scan_buf = ""
         except Exception:
             pass
-        if not (self.scan_entry.get().strip()):
+        raw_scan = self.scan_entry.get().strip()
+        qty_match = re.fullmatch(r"(\d{1,3})\*", raw_scan)
+        if qty_match:
+            qty = max(1, min(999, int(qty_match.group(1))))
+            self._pending_scan_qty = qty
+            self.scan_entry.delete(0, tk.END)
+            try:
+                self.right_title_lbl.configure(text=f"Quantity {qty}: scan or choose a product")
+            except Exception:
+                pass
+            return "break"
+        if not raw_scan:
             try:
                 if getattr(self, "_stage", "cart") == "cart" and self.cart_lines:
                     self._show_review_panel()
@@ -3437,10 +3580,13 @@ class CashierPage(tk.Frame):
         product_id = row["id"]
         name = row["name"]
         price = float(row["sell_price"])
+        qty_to_add = max(1, min(999, int(getattr(self, "_pending_scan_qty", 1) or 1)))
+        self._pending_scan_qty = 1
+        self._remember_cart_state()
 
         for line in self.cart_lines:
             if line["product_id"] == product_id:
-                line["qty"] += 1
+                line["qty"] += qty_to_add
                 if "discount_pct" not in line:
                     line["discount_pct"] = 0.0
                 # Keep barcode on the line (needed for seasonal sale lookups)
@@ -3479,7 +3625,8 @@ class CashierPage(tk.Frame):
             "barcode": bc_key,
             "name": name,
             "price": price,
-            "qty": 1,
+            "original_price": price,
+            "qty": qty_to_add,
             "discount_pct": float(sale_pct if sale_pct > 0 else 0.0),
             "sale_pct": float(sale_pct if sale_pct > 0 else 0.0),
             "sale_applied": bool(sale_pct > 0),
@@ -3633,6 +3780,9 @@ class CashierPage(tk.Frame):
             except Exception:
                 old_disc = 0.0
 
+            self._remember_cart_state()
+            if "original_price" not in line:
+                line["original_price"] = float(old_price)
             line["price"] = float(new_price)
             line["discount_pct"] = float(val)
 
@@ -3719,6 +3869,8 @@ class CashierPage(tk.Frame):
         for idx, line in enumerate(self.cart_lines):
             if "discount_pct" not in line:
                 line["discount_pct"] = 0.0
+            if "original_price" not in line:
+                line["original_price"] = float(line.get("price") or 0.0)
             self._recalc_line(line)
 
             total += float(line.get("line_total") or 0)
@@ -3739,10 +3891,21 @@ class CashierPage(tk.Frame):
                 except Exception:
                     disc_text = "Offer"
 
+            qty = max(1, int(line.get("qty") or 1))
+            original_unit = float(line.get("original_price", line.get("price", 0)) or 0.0)
+            final_unit = float(line.get("line_total") or 0.0) / qty
+            unit_discount = max(0.0, original_unit - final_unit)
+            is_discounted = unit_discount > 0.005
+            item_text = str(line.get("name", ""))
+            if is_discounted:
+                effective_pct = (unit_discount / original_unit * 100.0) if original_unit > 0 else 0.0
+                item_text += f"  [WAS {money(original_unit)} → {money(final_unit)}]"
+                disc_text = f"-{money(unit_discount)} ({effective_pct:.0f}%)"
             tag = "odd" if idx % 2 else "even"
-            self.tree.insert("", tk.END, tags=(tag,), values=(
-                line.get("name", ""),
-                money(float(line.get("price") or 0)),
+            tags = (tag, "discounted") if is_discounted else (tag,)
+            self.tree.insert("", tk.END, tags=tags, values=(
+                item_text,
+                money(final_unit),
                 int(line.get("qty") or 0),
                 disc_text,
                 money(float(line.get("line_total") or 0)),
@@ -3785,6 +3948,8 @@ class CashierPage(tk.Frame):
         if getattr(self, "_stage", "cart") == "cart":
             self._primary_enabled_requested = True
         self._apply_primary_state()
+        self._save_cashier_recovery()
+        self._update_held_order_button()
 
     def _bundle_offer_total(self, price: float, qty: int, offer: dict) -> float | None:
         try:
@@ -4220,7 +4385,7 @@ class CashierPage(tk.Frame):
 
         outer = Card(win, padx=14, pady=14)
         outer.pack(fill="both", expand=True, padx=12, pady=12)
-        HeaderBar(outer.inner, "Held Orders", "Resume a paused cart. Held orders clear when the app closes.").pack(fill="x")
+        HeaderBar(outer.inner, "Held Orders", "Resume a paused cart. Held orders are saved across restarts.").pack(fill="x")
 
         cols = ("label", "items", "total", "time")
         tree = ttk.Treeview(outer.inner, columns=cols, show="headings", height=10)
@@ -4271,6 +4436,8 @@ class CashierPage(tk.Frame):
             self.exchange_return_ids = list(order.get("exchange_return_ids") or [])
             self.exchange_bon_codes = list(order.get("exchange_bon_codes") or [])
             self.exchange_original_sale_id = order.get("exchange_original_sale_id")
+            # Keep resumed store credit crash-safe as soon as it becomes active.
+            self._persist_exchange_credit()
             self._wheel_prize_claimed = bool(order.get("wheel_prize_claimed", False))
             self._wheel_discount_pct = float(order.get("wheel_discount_pct") or 0.0)
             self._wheel_receipt_label = str(order.get("wheel_receipt_label") or "")
@@ -4301,6 +4468,8 @@ class CashierPage(tk.Frame):
                 self.held_orders.remove(order)
             except Exception:
                 pass
+            self._save_cashier_recovery()
+            self._update_held_order_button()
             refresh()
 
         btns = tk.Frame(outer.inner, bg=UI.CARD)
@@ -4344,6 +4513,7 @@ class CashierPage(tk.Frame):
         except Exception:
             q = 0
 
+        self._remember_cart_state()
         q2 = q + int(delta)
         if q2 <= 0:
             try:
@@ -4372,6 +4542,7 @@ class CashierPage(tk.Frame):
         idx = self._selected_cart_index()
         if idx is None:
             return
+        self._remember_cart_state()
         try:
             self.cart_lines.pop(idx)
         except Exception:
@@ -4640,6 +4811,7 @@ class CashierPage(tk.Frame):
                     "barcode": str(l.get("barcode") or ""),
                     "name": nm,
                     "price": float(l.get("price") or 0),
+                    "original_price": float(l.get("original_price", l.get("price", 0)) or 0),
                     "qty": int(l.get("qty") or 0),
                     "discount_pct": float(l.get("discount_pct") or 0),
                     "line_total": float(l.get("line_total") or 0),
@@ -5141,6 +5313,9 @@ class CashierPage(tk.Frame):
             if getattr(self, "_processing_sale", False):
                 return
             self._processing_sale = True
+            # Once checkout starts, do not offer the same cart after a hard crash;
+            # stock and sale persistence may already be partially in progress.
+            self._save_cashier_recovery(include_active=False)
 
             self._apply_primary_state()
             status_label.config(text="Processing sale...")
@@ -5152,7 +5327,7 @@ class CashierPage(tk.Frame):
             def rollback_stock():
                 for product_id, qty in reversed(stock_committed):
                     try:
-                        adjust_stock(product_id, qty)
+                        adjust_stock(product_id, qty, reason="Sale checkout rolled back", movement_type="SALE_ROLLBACK")
                     except Exception:
                         pass
                 stock_committed.clear()
@@ -5162,7 +5337,7 @@ class CashierPage(tk.Frame):
                     pid = l.get("product_id")
                     qty = int(l.get("qty") or 0)
                     if pid and qty and not l.get('is_quick'):
-                        if not adjust_stock(pid, -qty):
+                        if not adjust_stock(pid, -qty, reason="Sale completed", movement_type="SALE"):
                             raise RuntimeError(
                                 f"Could not update stock for {l.get('name') or 'an item'}. "
                                 "Refresh products and try again."
@@ -5302,6 +5477,7 @@ class CashierPage(tk.Frame):
                         "Check Settings > Receipt Printer and use Test Print."
                     )
                 self.cart_lines = []
+                self._undo_stack.clear()
                 self._wheel_prize_claimed = False
                 self._wheel_discount_pct = 0.0
                 self._wheel_receipt_label = ""
@@ -5322,6 +5498,7 @@ class CashierPage(tk.Frame):
                     messagebox.showerror("Error", f"Could not complete sale: {e}")
                 else:
                     self.cart_lines = []
+                    self._undo_stack.clear()
                     self._wheel_prize_claimed = False
                     self._wheel_discount_pct = 0.0
                     self._wheel_receipt_label = ""
@@ -5337,6 +5514,7 @@ class CashierPage(tk.Frame):
                         f"Do not submit it again. Use Reprint if a receipt is needed.\n{e}"
                     )
                 self._processing_sale = False
+                self._save_cashier_recovery()
                 self._apply_primary_state()
                 status_label.config(text="")
 
@@ -5559,18 +5737,43 @@ class CashierPage(tk.Frame):
                 messagebox.showerror("Not found", "Sale not found.", parent=win)
                 return
             try:
-                pdf_path = str(create_temp_receipt_pdf("Mask POS", sale, items))
-                ok = open_pdf_in_chrome(pdf_path)
+                ok = bool(print_configured_receipt(get_store_name(), sale, items))
                 if not ok:
-                    messagebox.showwarning("Print",
-                                           "Could not open the PDF. Check Chrome path or your default PDF viewer.",
-                                           parent=win)
+                    messagebox.showwarning(
+                        "Print", "Receipt was not sent. Check Settings > Receipt Printer and use Test Print.",
+                        parent=win,
+                    )
+                    return
             except Exception as e:
                 messagebox.showerror("Error", f"{type(e).__name__}: {e}", parent=win)
                 return
             _close()
 
+        def _do_gift_reprint():
+            sale_id = _resolve_sale_id(v.get())
+            if not sale_id:
+                messagebox.showerror("Missing", "Please enter a Sale ID or scan a receipt barcode.", parent=win)
+                return
+            sale, items = get_sale_detail_with_returns(int(sale_id))
+            if not sale:
+                messagebox.showerror("Not found", "Sale not found.", parent=win)
+                return
+            selected = self._select_gift_items(items)
+            if selected is None:
+                return
+            if not selected:
+                messagebox.showinfo("Gift receipt", "Select at least one item.", parent=win)
+                return
+            if not print_configured_gift_receipt(get_store_name(), sale, selected):
+                messagebox.showwarning(
+                    "Print", "Gift receipt was not sent. Check Settings > Receipt Printer and use Test Print.",
+                    parent=win,
+                )
+                return
+            _close()
+
         PrimaryButton(btns, "Reprint", _do_reprint).pack(side="left")
+        GhostButton(btns, "Gift Receipt", _do_gift_reprint).pack(side="left", padx=(8, 0))
         GhostButton(btns, "Go to Cash Drawer", self.go_to_sales_today).pack(side="left", padx=8)
         GhostButton(btns, "Close", _close).pack(side="right")
 
@@ -5687,6 +5890,67 @@ class CashierPage(tk.Frame):
 
 # ---------------- PRODUCTS PAGE ----------------
 
+def open_product_sales_history_window(parent, product_id, product_name=""):
+    win = tk.Toplevel(parent)
+    win.title(f"Sales History - {product_name or 'Product'}")
+    win.geometry("820x500")
+    win.minsize(620, 390)
+    win.configure(bg=UI.CONTENT_BG)
+    win.transient(parent.winfo_toplevel())
+    card = Card(win, padx=14, pady=14)
+    card.pack(fill="both", expand=True, padx=12, pady=12)
+    HeaderBar(card.inner, product_name or "Product Sales", "Selling price, quantities, returns, and voided sales.").pack(fill="x")
+    cols = ("date", "receipt", "qty", "returned", "price", "total", "status")
+    tree = ttk.Treeview(card.inner, columns=cols, show="headings", height=15)
+    specs = [("date","Date / time",145),("receipt","Receipt",85),("qty","Qty",55),("returned","Returned",70),("price","Sold at",85),("total","Line total",95),("status","Status",70)]
+    for col, title, width in specs:
+        tree.heading(col, text=title); tree.column(col, width=width, anchor=("center" if col in {"receipt","qty","returned","status"} else "w"))
+    tree.pack(fill="both", expand=True, pady=(10, 8))
+    tree.tag_configure("voided", foreground="#991b1b", background="#fee2e2")
+    sale_ids = {}
+    for idx, row in enumerate(list_product_sales(int(product_id), 500, True) or []):
+        sid = int(row_get(row, "sale_id", 0) or 0)
+        iid = f"sale_{sid}_{idx}"
+        sale_ids[iid] = sid
+        voided = bool(int(row_get(row, "is_voided", 0) or 0))
+        tree.insert("", tk.END, iid=iid, tags=(("voided",) if voided else ()), values=(
+            row_get(row,"created_at",""), row_get(row,"receipt_code","") or sid,
+            row_get(row,"qty",0), row_get(row,"returned_qty",0), money(row_get(row,"price",0)),
+            money(row_get(row,"line_total",0)), "VOID" if voided else "Active"))
+    def reprint():
+        sel = tree.selection()
+        if not sel:
+            messagebox.showinfo("Reprint", "Select a sale first.", parent=win); return
+        sale, items = get_sale_receipt_data(sale_ids.get(sel[0]))
+        if not sale or not print_configured_receipt(get_store_name(), sale, items):
+            messagebox.showwarning("Reprint", "Receipt was not sent. Check the configured printer.", parent=win)
+    row = tk.Frame(card.inner, bg=UI.CARD); row.pack(fill="x")
+    PrimaryButton(row, "Reprint Selected", reprint).pack(side="left")
+    GhostButton(row, "Close", win.destroy).pack(side="right")
+
+
+def open_product_price_history_window(parent, product_id, product_name=""):
+    win = tk.Toplevel(parent)
+    win.title(f"Price History - {product_name or 'Product'}")
+    win.geometry("650x430")
+    win.minsize(520, 340)
+    win.configure(bg=UI.CONTENT_BG)
+    win.transient(parent.winfo_toplevel())
+    card = Card(win, padx=14, pady=14); card.pack(fill="both", expand=True, padx=12, pady=12)
+    HeaderBar(card.inner, product_name or "Price History", "Every saved catalog price change.").pack(fill="x")
+    cols=("time","old","new","change","reason")
+    tree=ttk.Treeview(card.inner,columns=cols,show="headings",height=14)
+    for col,title,width in [("time","Changed",150),("old","Old",80),("new","New",80),("change","Change",80),("reason","Reason",190)]:
+        tree.heading(col,text=title); tree.column(col,width=width,anchor=("e" if col in {"old","new","change"} else "w"))
+    tree.pack(fill="both",expand=True,pady=(10,8))
+    for row in list_product_price_history(int(product_id),500) or []:
+        change=float(row_get(row,"price_change",0) or 0)
+        tree.insert("",tk.END,values=(row_get(row,"changed_at",""),money(row_get(row,"old_price",0)),money(row_get(row,"new_price",0)),f"{change:+.2f}",row_get(row,"reason","")))
+    if not tree.get_children():
+        tk.Label(card.inner,text="No price changes recorded yet.",bg=UI.CARD,fg=UI.MUTED).pack(anchor="w")
+    GhostButton(card.inner,"Close",win.destroy).pack(anchor="e")
+
+
 class ProductsPage(tk.Frame):
     def __init__(self, parent, on_product_added):
         super().__init__(parent, bg=UI.CONTENT_BG)
@@ -5758,6 +6022,11 @@ class ProductsPage(tk.Frame):
             lambda: self.add_clicked(send_host_print=True),
         ).pack(side="left", padx=(8, 0))
 
+        # Optional purchasing data stays below the print actions so workers can
+        # ignore it during normal product entry.
+        self.cost_e = field(left.inner, "Cost price (optional)")
+        self.supplier_e = field(left.inner, "Supplier (optional)")
+
         tk.Frame(left.inner, height=(12 if UI.COMPACT else 18), bg=UI.CARD).pack(fill="x")
         self.barcode_e = field(left.inner, "Barcode (optional)")
         self.location_e = field(left.inner, "Location / section (optional)")
@@ -5768,6 +6037,18 @@ class ProductsPage(tk.Frame):
         self.low_e = tk.Entry(row_low, bd=1, relief="solid")
         self.low_e.insert(0, "0")
         self.low_e.pack(side="left", fill="x", expand=True)
+
+        row_cat = tk.Frame(left.inner, bg=UI.CARD)
+        row_cat.pack(fill="x", pady=6)
+        tk.Label(row_cat, text="Category", bg=UI.CARD, fg="#334155", width=16, anchor="w").pack(side="left")
+        self.category_cb = ttk.Combobox(row_cat, values=[], state="normal")
+        self.category_cb.pack(side="left", fill="x", expand=True)
+
+        row_brand = tk.Frame(left.inner, bg=UI.CARD)
+        row_brand.pack(fill="x", pady=6)
+        tk.Label(row_brand, text="Brand", bg=UI.CARD, fg="#334155", width=16, anchor="w").pack(side="left")
+        self.brand_e = tk.Entry(row_brand, bd=1, relief="solid")
+        self.brand_e.pack(side="left", fill="x", expand=True)
 
         self.last_barcode = tk.StringVar(value="")
         tk.Label(left.inner, textvariable=self.last_barcode, bg=UI.CARD, fg=UI.MUTED).pack(anchor="w", pady=(10, 0))
@@ -5782,6 +6063,7 @@ class ProductsPage(tk.Frame):
         self.search_e.bind("<KeyRelease>", lambda e: self.refresh_list())
         GhostButton(search_row, "Search", self.refresh_list).pack(side="left", padx=(0, 8))
         GhostButton(search_row, "Refresh", self.refresh_list).pack(side="left")
+        GhostButton(search_row, "Reorder", self.open_reorder_suggestions).pack(side="left", padx=(8, 0))
 
         cols = ("name", "price", "stock", "barcode", "location", "low")
         self.prod_tree = ttk.Treeview(right.inner, columns=cols, show="headings", height=12)
@@ -5826,13 +6108,68 @@ class ProductsPage(tk.Frame):
         self.edit_location = edit_field("Location", 3, width=16)
         self.edit_low = edit_field("Low", 4, width=10)
 
+        # Row 3 & 4: Category and Brand
+        tk.Label(edit, text="Category", bg=UI.CARD, fg="#334155").grid(row=3, column=0, sticky="w", padx=(0, 6), pady=(8, 0))
+        self.edit_category = ttk.Combobox(edit, width=26, values=[], state="normal")
+        self.edit_category.grid(row=4, column=0, sticky="w", padx=(0, 12))
+
+        tk.Label(edit, text="Brand", bg=UI.CARD, fg="#334155").grid(row=3, column=1, sticky="w", padx=(0, 6), pady=(8, 0))
+        self.edit_brand = tk.Entry(edit, width=12, bd=1, relief="solid")
+        self.edit_brand.grid(row=4, column=1, sticky="w", padx=(0, 12))
+
         btns = tk.Frame(edit, bg=UI.CARD)
-        btns.grid(row=2, column=5, sticky="e", padx=(10, 0))
+        btns.grid(row=4, column=3, columnspan=3, sticky="e", padx=(10, 0), pady=(8, 0))
 
         PrimaryButton(btns, "Save", self.save_changes).pack(side="left", padx=(0, 8))
+        GhostButton(btns, "Details", self.open_product_details).pack(side="left", padx=(0, 8))
         DangerButton(btns, "Delete", self.delete_selected).pack(side="left")
 
+        self.selected_detail_lbl = tk.Label(
+            edit, text="Select an item for cost, supplier, and stock history.",
+            bg=UI.CARD, fg=UI.MUTED, anchor="w", justify="left",
+        )
+        self.selected_detail_lbl.grid(row=5, column=0, columnspan=8, sticky="ew", pady=(12, 0))
+
+    def open_reorder_suggestions(self):
+        win = tk.Toplevel(self)
+        win.title("Reorder Suggestions")
+        win.geometry("900x560")
+        win.minsize(680, 430)
+        win.configure(bg=UI.CONTENT_BG)
+        win.transient(self.winfo_toplevel())
+        card = Card(win, padx=14, pady=14); card.pack(fill="both", expand=True, padx=12, pady=12)
+        HeaderBar(card.inner, "Reorder Suggestions", "Optional suggestions based on recent sales speed and current stock.").pack(fill="x")
+        controls=tk.Frame(card.inner,bg=UI.CARD); controls.pack(fill="x",pady=(10,8))
+        days_var=tk.StringVar(value="30"); target_var=tk.StringVar(value="14"); supplier_var=tk.StringVar(value="")
+        for label,var,width in [("Sales days",days_var,6),("Target days",target_var,6),("Supplier",supplier_var,20)]:
+            tk.Label(controls,text=label,bg=UI.CARD,fg=UI.TEXT).pack(side="left",padx=(0,4))
+            tk.Entry(controls,textvariable=var,width=width,bd=1,relief="solid").pack(side="left",padx=(0,10))
+        cols=("supplier","product","sold","daily","stock","cover","suggested","cost")
+        tree=ttk.Treeview(card.inner,columns=cols,show="headings",height=16)
+        for col,title,width in [("supplier","Supplier",125),("product","Product",210),("sold","Sold",60),("daily","/ day",65),("stock","Stock",60),("cover","Days cover",75),("suggested","Order",70),("cost","Est. cost",85)]:
+            tree.heading(col,text=title); tree.column(col,width=width,anchor=("w" if col in {"supplier","product"} else "center"))
+        tree.pack(fill="both",expand=True)
+        summary=tk.StringVar(value=""); tk.Label(card.inner,textvariable=summary,bg=UI.CARD,fg=UI.MUTED).pack(anchor="w",pady=(8,0))
+        def load():
+            try: rows=reorder_suggestions(int(days_var.get()),int(target_var.get()),supplier_var.get().strip(),2000) or []
+            except Exception as exc: messagebox.showerror("Reorder",str(exc),parent=win); return
+            tree.delete(*tree.get_children()); total_cost=0.0
+            for idx,row in enumerate(rows):
+                cost=float(row_get(row,"estimated_cost",0) or 0); total_cost+=cost
+                cover=row_get(row,"days_cover",None)
+                tree.insert("",tk.END,iid=str(idx),values=(row_get(row,"supplier","") or "Unassigned",row_get(row,"name",""),row_get(row,"net_qty_sold",0),f"{float(row_get(row,'avg_daily_units',0) or 0):.2f}",row_get(row,"stock_qty",0),(f"{float(cover):.1f}" if cover is not None else "—"),row_get(row,"suggested_qty",0),money(cost)))
+            summary.set(f"{len(rows)} products suggested   |   Estimated cost where costs are entered: {money(total_cost)}")
+        PrimaryButton(controls,"Refresh",load).pack(side="left")
+        GhostButton(card.inner,"Close",win.destroy).pack(anchor="e",pady=(8,0)); load()
+
     def refresh_list(self):
+        try:
+            cats = get_distinct_categories() or []
+            self.category_cb['values'] = cats
+            self.edit_category['values'] = cats
+        except Exception:
+            pass
+
         query = self.search_e.get().strip() if hasattr(self, "search_e") else ""
         rows = list_products(query)
 
@@ -5852,6 +6189,7 @@ class ProductsPage(tk.Frame):
         for i in self.prod_tree.get_children():
             self.prod_tree.delete(i)
 
+        self._product_rows_by_id = {}
         for r in rows:
             try:
                 p_cat = str(row_get(r, "category") or "").strip()
@@ -5876,6 +6214,10 @@ class ProductsPage(tk.Frame):
                 tags = ("low_stock",)
 
             pid = row_get(r, "id", "")
+            try:
+                self._product_rows_by_id[int(pid)] = dict(r)
+            except Exception:
+                pass
             name = row_get(r, "name", "")
             sell_price = row_get(r, "sell_price", 0)
             barcode = row_get(r, "barcode", "")
@@ -5918,6 +6260,107 @@ class ProductsPage(tk.Frame):
         self.edit_low.insert(0, vals[5])
 
         self.selected_barcode = vals[3]
+        product = getattr(self, "_product_rows_by_id", {}).get(self.selected_product_id, {})
+        
+        cat = str(row_get(product, "category", "") or "").strip()
+        brand = str(row_get(product, "brand", "") or "").strip()
+        self.edit_category.set(cat)
+        self.edit_brand.delete(0, tk.END)
+        self.edit_brand.insert(0, brand)
+
+        cost = float(row_get(product, "cost_price", 0.0) or 0.0)
+        supplier = str(row_get(product, "supplier", "") or "").strip() or "Not set"
+        margin = float(vals[1] or 0.0) - cost
+        self.selected_detail_lbl.config(
+            text=f"Cost: {money(cost)}   |   Supplier: {supplier}   |   Unit margin: {money(margin)}"
+        )
+
+    def open_product_details(self):
+        if not self.selected_product_id:
+            messagebox.showinfo("Select", "Select a product first.")
+            return
+        product = getattr(self, "_product_rows_by_id", {}).get(self.selected_product_id, {})
+        win = tk.Toplevel(self)
+        win.title("Product Details")
+        win.geometry("720x520")
+        win.minsize(560, 420)
+        win.configure(bg=UI.CONTENT_BG)
+        win.transient(self.winfo_toplevel())
+        win.grab_set()
+
+        card = Card(win, padx=16, pady=16)
+        card.pack(fill="both", expand=True, padx=12, pady=12)
+        tk.Label(card.inner, text=str(row_get(product, "name", "Product")), font=UI.FONT_LG,
+                 bg=UI.CARD, fg=UI.TEXT).pack(anchor="w")
+        tk.Label(card.inner, text=f"Barcode: {row_get(product, 'barcode', '')}   |   Sell price: {money(row_get(product, 'sell_price', 0))}",
+                 bg=UI.CARD, fg=UI.MUTED).pack(anchor="w", pady=(3, 10))
+
+        fields = tk.Frame(card.inner, bg=UI.CARD)
+        fields.pack(fill="x")
+        tk.Label(fields, text="Cost price (optional)", bg=UI.CARD, fg=UI.TEXT).grid(row=0, column=0, sticky="w")
+        cost_var = tk.StringVar(value=(f"{float(row_get(product, 'cost_price', 0) or 0):.2f}"))
+        tk.Entry(fields, textvariable=cost_var, width=18, bd=1, relief="solid").grid(row=1, column=0, sticky="w", padx=(0, 12))
+        tk.Label(fields, text="Supplier (optional)", bg=UI.CARD, fg=UI.TEXT).grid(row=0, column=1, sticky="w")
+        supplier_var = tk.StringVar(value=str(row_get(product, "supplier", "") or ""))
+        tk.Entry(fields, textvariable=supplier_var, width=34, bd=1, relief="solid").grid(row=1, column=1, sticky="ew")
+        fields.grid_columnconfigure(1, weight=1)
+
+        def load_history():
+            tree.delete(*tree.get_children())
+            for movement in list_inventory_movements(self.selected_product_id, 500) or []:
+                tree.insert("", tk.END, values=(
+                    row_get(movement, "created_at", ""), row_get(movement, "movement_type", ""),
+                    row_get(movement, "qty_change", 0), row_get(movement, "qty_before", 0),
+                    row_get(movement, "qty_after", 0), row_get(movement, "reason", ""),
+                ))
+
+        def save_details():
+            try:
+                cost = max(0.0, float(cost_var.get().strip() or "0"))
+            except Exception:
+                messagebox.showerror("Invalid", "Cost price must be a number.", parent=win)
+                return
+            try:
+                update_product_details(self.selected_product_id, cost, supplier_var.get().strip())
+                self.refresh_list()
+                if str(self.selected_product_id) in self.prod_tree.get_children():
+                    self.prod_tree.selection_set(str(self.selected_product_id))
+                    self.on_select(None)
+                messagebox.showinfo("Saved", "Optional product details saved.", parent=win)
+            except Exception as exc:
+                messagebox.showerror("Could not save", str(exc), parent=win)
+
+        # Pack buttons at the bottom so they are always visible
+        buttons = tk.Frame(card.inner, bg=UI.CARD)
+        buttons.pack(side="bottom", fill="x", pady=(12, 0))
+        PrimaryButton(buttons, "Save Details", save_details).pack(side="left")
+        GhostButton(buttons, "Refresh History", load_history).pack(side="left", padx=(8, 0))
+        GhostButton(buttons, "Sales", lambda: open_product_sales_history_window(
+            win, self.selected_product_id, str(row_get(product, "name", ""))
+        )).pack(side="left", padx=(8, 0))
+        GhostButton(buttons, "Price Changes", lambda: open_product_price_history_window(
+            win, self.selected_product_id, str(row_get(product, "name", ""))
+        )).pack(side="left", padx=(8, 0))
+        GhostButton(buttons, "Close", win.destroy).pack(side="right")
+
+        tk.Label(card.inner, text="Inventory movement history", font=UI.FONT_MD,
+                 bg=UI.CARD, fg=UI.TEXT).pack(anchor="w", pady=(16, 6))
+
+        cols = ("time", "type", "change", "before", "after", "reason")
+        tree_wrap = tk.Frame(card.inner, bg=UI.CARD)
+        tree_wrap.pack(fill="both", expand=True)
+        tree = ttk.Treeview(tree_wrap, columns=cols, show="headings", height=6)
+        for col, title, width in [
+            ("time", "Time", 140), ("type", "Type", 110), ("change", "+/-", 55),
+            ("before", "Before", 60), ("after", "After", 60), ("reason", "Reason", 220),
+        ]:
+            tree.heading(col, text=title)
+            tree.column(col, width=width, anchor=("center" if col in {"change", "before", "after"} else "w"))
+        vsb = ttk.Scrollbar(tree_wrap, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=vsb.set)
+        tree.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="right", fill="y")
+        load_history()
 
     def add_selected_to_cart(self):
         if not self.selected_barcode:
@@ -5935,11 +6378,13 @@ class ProductsPage(tk.Frame):
             stock = int(float(self.edit_stock.get().strip()))
             low = int(float(self.edit_low.get().strip() or "0"))
             location = self.edit_location.get().strip()
+            category = self.edit_category.get().strip()
+            brand = self.edit_brand.get().strip()
         except Exception:
             messagebox.showerror("Invalid", "Check name, price, stock, location, low values.")
             return
 
-        update_product(self.selected_product_id, name, price, stock, low, location)
+        update_product(self.selected_product_id, name, price, stock, low, location, category, brand)
         messagebox.showinfo("Saved", "Product updated.")
         self.refresh_list()
 
@@ -6014,6 +6459,12 @@ class ProductsPage(tk.Frame):
             return
 
         location = self.location_e.get().strip() if hasattr(self, "location_e") else ""
+        try:
+            cost_price = max(0.0, float(self.cost_e.get().strip() or "0"))
+        except Exception:
+            messagebox.showerror("Invalid", "Cost price must be a number or left blank.")
+            return
+        supplier = self.supplier_e.get().strip() if hasattr(self, "supplier_e") else ""
 
         manual_barcode_raw = ""
         try:
@@ -6032,15 +6483,20 @@ class ProductsPage(tk.Frame):
                 self.barcode_e.focus()
                 return
 
+        category = self.category_cb.get().strip()
+        brand = self.brand_e.get().strip()
+
         barcode = add_product(
             name=name,
-            category="",
-            brand="",
+            category=category,
+            brand=brand,
             sell_price=price,
             stock_qty=stock,
             low_stock_level=low,
             barcode=(manual_barcode or None),
             location=location,
+            cost_price=cost_price,
+            supplier=supplier,
         )
 
         barcode_display = str(barcode or "")
@@ -6089,9 +6545,13 @@ class ProductsPage(tk.Frame):
         self.name_e.delete(0, tk.END)
         self.barcode_e.delete(0, tk.END)
         self.location_e.delete(0, tk.END)
+        self.cost_e.delete(0, tk.END)
+        self.supplier_e.delete(0, tk.END)
         self.price_e.delete(0, tk.END)
         self.stock_e.delete(0, tk.END)
         self.low_e.delete(0, tk.END)
+        self.category_cb.set("")
+        self.brand_e.delete(0, tk.END)
         self.low_e.insert(0, "0")
         self.name_e.focus()
 
@@ -6162,6 +6622,15 @@ class BarcodesPage(tk.Frame):
         GhostButton(qty_row, "Print Only", self.print_selected_only).pack(side="left", padx=(8, 0))
         GhostButton(qty_row, "Send Host Only", self.send_selected_to_host_only).pack(side="left", padx=(8, 0))
         GhostButton(qty_row, "Stop Label Printer", self.stop_label_printer).pack(side="left", padx=(8, 0))
+        GhostButton(qty_row, "Details", self.open_product_details).pack(side="right")
+
+        self.selected_detail_lbl = tk.Label(
+            body.inner, text="Select an item for cost, supplier, and stock history.",
+            bg=UI.CARD, fg=UI.MUTED, anchor="w", justify="left"
+        )
+        self.selected_detail_lbl.pack(fill="x", pady=(8, 0))
+
+        self.tree.bind("<<TreeviewSelect>>", self.on_select)
 
     def refresh(self):
         """Reload product list (honors current search query if present)."""
@@ -6172,8 +6641,14 @@ class BarcodesPage(tk.Frame):
             q = ""
         self.tree.delete(*self.tree.get_children())
         rows = list_products(q)
+        self._product_rows_by_id = {}
         for r in rows:
-            self.tree.insert("", tk.END, iid=str(row_get(r, "id", "")), values=(
+            pid = row_get(r, "id", "")
+            try:
+                self._product_rows_by_id[int(pid)] = dict(r)
+            except Exception:
+                pass
+            self.tree.insert("", tk.END, iid=str(pid), values=(
                 row_get(r, "name", ""),
                 f"{float(row_get(r, 'sell_price', 0) or 0):.2f}",
                 row_get(r, "barcode", ""),
@@ -6372,7 +6847,10 @@ class BarcodesPage(tk.Frame):
 
     def _replenish_selected_stock(self, product_id: int, qty: int) -> bool:
         try:
-            ok = bool(adjust_stock(int(product_id), int(qty)))
+            ok = bool(adjust_stock(
+                int(product_id), int(qty),
+                reason="Stock received / labels printed", movement_type="STOCK_IN",
+            ))
         except Exception:
             ok = False
         if ok:
@@ -6384,6 +6862,112 @@ class BarcodesPage(tk.Frame):
             except Exception:
                 pass
         return ok
+
+    def on_select(self, event):
+        sel = self.tree.selection()
+        if not sel:
+            return
+        try:
+            self.selected_product_id = int(sel[0])
+            vals = self.tree.item(sel[0], "values")
+            product = getattr(self, "_product_rows_by_id", {}).get(self.selected_product_id, {})
+            cost = float(row_get(product, "cost_price", 0.0) or 0.0)
+            supplier = str(row_get(product, "supplier", "") or "").strip() or "Not set"
+            margin = float(vals[1] or 0.0) - cost
+            self.selected_detail_lbl.config(
+                text=f"Cost: {money(cost)}   |   Supplier: {supplier}   |   Unit margin: {money(margin)}"
+            )
+        except Exception:
+            pass
+
+    def open_product_details(self):
+        sel = self.tree.selection()
+        if not sel:
+            messagebox.showinfo("Select", "Select a product first.")
+            return
+        self.selected_product_id = int(sel[0])
+        product = getattr(self, "_product_rows_by_id", {}).get(self.selected_product_id, {})
+        win = tk.Toplevel(self)
+        win.title("Product Details")
+        win.geometry("720x520")
+        win.minsize(560, 420)
+        win.configure(bg=UI.CONTENT_BG)
+        win.transient(self.winfo_toplevel())
+        win.grab_set()
+
+        card = Card(win, padx=16, pady=16)
+        card.pack(fill="both", expand=True, padx=12, pady=12)
+        tk.Label(card.inner, text=str(row_get(product, "name", "Product")), font=UI.FONT_LG,
+                 bg=UI.CARD, fg=UI.TEXT).pack(anchor="w")
+        tk.Label(card.inner, text=f"Barcode: {row_get(product, 'barcode', '')}   |   Sell price: {money(row_get(product, 'sell_price', 0))}",
+                 bg=UI.CARD, fg=UI.MUTED).pack(anchor="w", pady=(3, 10))
+
+        fields = tk.Frame(card.inner, bg=UI.CARD)
+        fields.pack(fill="x")
+        tk.Label(fields, text="Cost price (optional)", bg=UI.CARD, fg=UI.TEXT).grid(row=0, column=0, sticky="w")
+        cost_var = tk.StringVar(value=(f"{float(row_get(product, 'cost_price', 0) or 0):.2f}"))
+        tk.Entry(fields, textvariable=cost_var, width=18, bd=1, relief="solid").grid(row=1, column=0, sticky="w", padx=(0, 12))
+        tk.Label(fields, text="Supplier (optional)", bg=UI.CARD, fg=UI.TEXT).grid(row=0, column=1, sticky="w")
+        supplier_var = tk.StringVar(value=str(row_get(product, "supplier", "") or ""))
+        tk.Entry(fields, textvariable=supplier_var, width=34, bd=1, relief="solid").grid(row=1, column=1, sticky="ew")
+        fields.grid_columnconfigure(1, weight=1)
+
+        def load_history():
+            tree.delete(*tree.get_children())
+            for movement in list_inventory_movements(self.selected_product_id, 500) or []:
+                tree.insert("", tk.END, values=(
+                    row_get(movement, "created_at", ""), row_get(movement, "movement_type", ""),
+                    row_get(movement, "qty_change", 0), row_get(movement, "qty_before", 0),
+                    row_get(movement, "qty_after", 0), row_get(movement, "reason", ""),
+                ))
+
+        def save_details():
+            try:
+                cost = max(0.0, float(cost_var.get().strip() or "0"))
+            except Exception:
+                messagebox.showerror("Invalid", "Cost price must be a number.", parent=win)
+                return
+            try:
+                update_product_details(self.selected_product_id, cost, supplier_var.get().strip())
+                self.refresh()
+                if str(self.selected_product_id) in self.tree.get_children():
+                    self.tree.selection_set(str(self.selected_product_id))
+                    self.on_select(None)
+                messagebox.showinfo("Saved", "Optional product details saved.", parent=win)
+            except Exception as exc:
+                messagebox.showerror("Could not save", str(exc), parent=win)
+
+        # Pack buttons at the bottom so they are always visible
+        buttons = tk.Frame(card.inner, bg=UI.CARD)
+        buttons.pack(side="bottom", fill="x", pady=(12, 0))
+        PrimaryButton(buttons, "Save Details", save_details).pack(side="left")
+        GhostButton(buttons, "Refresh History", load_history).pack(side="left", padx=(8, 0))
+        GhostButton(buttons, "Sales", lambda: open_product_sales_history_window(
+            win, self.selected_product_id, str(row_get(product, "name", ""))
+        )).pack(side="left", padx=(8, 0))
+        GhostButton(buttons, "Price Changes", lambda: open_product_price_history_window(
+            win, self.selected_product_id, str(row_get(product, "name", ""))
+        )).pack(side="left", padx=(8, 0))
+        GhostButton(buttons, "Close", win.destroy).pack(side="right")
+
+        tk.Label(card.inner, text="Inventory movement history", font=UI.FONT_MD,
+                 bg=UI.CARD, fg=UI.TEXT).pack(anchor="w", pady=(16, 6))
+
+        cols = ("time", "type", "change", "before", "after", "reason")
+        tree_wrap = tk.Frame(card.inner, bg=UI.CARD)
+        tree_wrap.pack(fill="both", expand=True)
+        tree = ttk.Treeview(tree_wrap, columns=cols, show="headings", height=6)
+        for col, title, width in [
+            ("time", "Time", 140), ("type", "Type", 110), ("change", "+/-", 55),
+            ("before", "Before", 60), ("after", "After", 60), ("reason", "Reason", 220),
+        ]:
+            tree.heading(col, text=title)
+            tree.column(col, width=width, anchor=("center" if col in {"change", "before", "after"} else "w"))
+        vsb = ttk.Scrollbar(tree_wrap, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=vsb.set)
+        tree.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="right", fill="y")
+        load_history()
 
 
 # ---------------- ANALYTICS PAGE ----------------
@@ -6437,6 +7021,7 @@ class AnalyticsPage(tk.Frame):
         self.end_e.pack(side="left", padx=(0, 10))
 
         GhostButton(controls, "Refresh", self.refresh).pack(side="left")
+        GhostButton(controls, "Discount Impact", self.open_discount_impact).pack(side="left", padx=(8, 0))
 
         self.start_e.bind("<Return>", lambda e: self.refresh())
         self.end_e.bind("<Return>", lambda e: self.refresh())
@@ -6552,9 +7137,9 @@ class AnalyticsPage(tk.Frame):
         for i in range(4):
             kpi_row.grid_columnconfigure(i, weight=1)
 
-        self.kpi_gross = self._kpi_card(kpi_row, 0, "Net sales", "$0.00")
-        self.kpi_orders = self._kpi_card(kpi_row, 1, "Orders", "0")
-        self.kpi_items = self._kpi_card(kpi_row, 2, "Items sold", "0")
+        self.kpi_gross = self._kpi_card(kpi_row, 0, "Total sales", "$0.00")
+        self.kpi_cash = self._kpi_card(kpi_row, 1, "Cash collected", "$0.00")
+        self.kpi_items = self._kpi_card(kpi_row, 2, "Net items sold", "0")
         self.kpi_aov = self._kpi_card(kpi_row, 3, "Average order value", "$0.00")
 
         mid = tk.Frame(content, bg=UI.CONTENT_BG)
@@ -6691,6 +7276,121 @@ class AnalyticsPage(tk.Frame):
         prod_vsb.grid(row=0, column=1, sticky="ns")
         prod_hsb.grid(row=1, column=0, sticky="ew")
 
+        health_card = Card(content, padx=14, pady=14)
+        health_card.pack(fill="both", expand=True, pady=(10, 0))
+        health_head = tk.Frame(health_card.inner, bg=UI.CARD)
+        health_head.pack(fill="x")
+        tk.Label(health_head, text="Data Health", font=UI.FONT_LG, bg=UI.CARD, fg=UI.TEXT).pack(side="left")
+        self.data_health_summary_lbl = tk.Label(health_head, text="", font=UI.FONT_SM, bg=UI.CARD, fg=UI.MUTED)
+        self.data_health_summary_lbl.pack(side="left", padx=12)
+        GhostButton(health_head, "Run Checks", self._refresh_data_health).pack(side="right")
+        GhostButton(health_head, "Go to Products", self._go_products_for_health).pack(side="right", padx=(0, 8))
+        tk.Label(
+            health_card.inner,
+            text="Only real integrity problems are checked. Blank location and low-stock settings are intentionally ignored.",
+            bg=UI.CARD, fg=UI.MUTED, font=UI.FONT_SM,
+        ).pack(anchor="w", pady=(4, 8))
+
+        health_wrap = tk.Frame(health_card.inner, bg=UI.CARD)
+        health_wrap.pack(fill="both", expand=True)
+        health_wrap.grid_columnconfigure(0, weight=2)
+        health_wrap.grid_columnconfigure(1, weight=3)
+        health_wrap.grid_rowconfigure(0, weight=1)
+        self.data_health_tree = ttk.Treeview(
+            health_wrap, columns=("status", "check", "count"), show="headings", height=9,
+        )
+        self.data_health_tree.heading("status", text="Status")
+        self.data_health_tree.heading("check", text="Check")
+        self.data_health_tree.heading("count", text="Count")
+        self.data_health_tree.column("status", width=75, anchor="center")
+        self.data_health_tree.column("check", width=300)
+        self.data_health_tree.column("count", width=70, anchor="center")
+        self.data_health_tree.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
+        self.data_health_tree.tag_configure("OK", foreground="#166534")
+        self.data_health_tree.tag_configure("MEDIUM", foreground="#92400e")
+        self.data_health_tree.tag_configure("HIGH", foreground="#b91c1c")
+        self.data_health_tree.tag_configure("CRITICAL", foreground="#7f1d1d")
+        self.data_health_tree.bind("<<TreeviewSelect>>", self._show_data_health_detail)
+
+        self.data_health_detail = tk.Text(
+            health_wrap, height=9, wrap="word", bg="#f8fafc", fg=UI.TEXT,
+            relief="solid", bd=1, font=UI.FONT_SM, padx=10, pady=8,
+        )
+        self.data_health_detail.grid(row=0, column=1, sticky="nsew")
+        self.data_health_detail.configure(state="disabled")
+        self._data_health_by_key = {}
+        self.after(150, self._refresh_data_health)
+
+    def _refresh_data_health(self):
+        try:
+            health = data_health_summary(8) or {}
+            issues = list(health.get("issues") or [])
+
+            backup = get_backup_config() or {}
+            remote = str(backup.get("backup_rclone_remote") or "").strip()
+            offsite = backup.get("offsite") or {}
+            if remote and offsite and not bool(offsite.get("ok")):
+                issues.append({
+                    "key": "offsite_backup", "title": "Off-site backup needs attention", "count": 1,
+                    "severity": "HIGH", "explanation": "The latest configured off-site backup upload did not succeed.",
+                    "samples": [str(offsite.get("message") or "Open Settings > Backups for details.")[:240]],
+                })
+
+            sync = cloud_sync_status(probe=False) or {}
+            pending = int(sync.get("pending", 0) or 0)
+            last_error = str(sync.get("last_error") or "").strip()
+            if pending or last_error:
+                issues.append({
+                    "key": "cloud_sync", "title": "Cloud sync queue / error", "count": pending or 1,
+                    "severity": "HIGH" if last_error else "MEDIUM",
+                    "explanation": "Pending or failed cloud records can make another register show older data.",
+                    "samples": [last_error[:240]] if last_error else [f"Pending records: {pending}"],
+                })
+
+            self._data_health_by_key = {str(i.get("key")): i for i in issues}
+            self.data_health_tree.delete(*self.data_health_tree.get_children())
+            problem_count = 0
+            for issue in issues:
+                count = int(issue.get("count", 0) or 0)
+                status = str(issue.get("severity") or ("OK" if count == 0 else "MEDIUM")).upper()
+                if count > 0:
+                    problem_count += 1
+                self.data_health_tree.insert(
+                    "", tk.END, iid=str(issue.get("key")), tags=(status,),
+                    values=(status, issue.get("title", ""), count),
+                )
+            checked = str(health.get("checked_at") or "")
+            self.data_health_summary_lbl.config(
+                text=(f"{problem_count} check(s) need attention  |  {checked}" if problem_count else f"All checks OK  |  {checked}"),
+                fg=(UI.DANGER if problem_count else UI.SUCCESS),
+            )
+            children = self.data_health_tree.get_children()
+            if children:
+                first_problem = next((x for x in children if int(self._data_health_by_key.get(x, {}).get("count", 0) or 0) > 0), children[0])
+                self.data_health_tree.selection_set(first_problem)
+                self._show_data_health_detail()
+        except Exception as exc:
+            self.data_health_summary_lbl.config(text=f"Checks could not run: {str(exc)[:120]}", fg=UI.DANGER)
+
+    def _show_data_health_detail(self, _event=None):
+        selected = self.data_health_tree.selection()
+        if not selected:
+            return
+        issue = self._data_health_by_key.get(str(selected[0]), {})
+        lines = [str(issue.get("title") or ""), "", str(issue.get("explanation") or "")]
+        samples = list(issue.get("samples") or [])
+        if samples:
+            lines.extend(["", "Examples:"] + [f"• {sample}" for sample in samples])
+        self.data_health_detail.configure(state="normal")
+        self.data_health_detail.delete("1.0", tk.END)
+        self.data_health_detail.insert("1.0", "\n".join(lines))
+        self.data_health_detail.configure(state="disabled")
+
+    def _go_products_for_health(self):
+        top = self.winfo_toplevel()
+        if hasattr(top, "show_page"):
+            top.show_page("ProductsPage")
+
     def _kpi_card(self, parent, col, title, value):
         c = Card(parent, padx=14, pady=12)
         c.grid(row=0, column=col, sticky="nsew", padx=(0 if col == 0 else 10, 0))
@@ -6700,30 +7400,12 @@ class AnalyticsPage(tk.Frame):
         return v
 
     def _make_chart(self, parent):
-        try:
-            from matplotlib.figure import Figure
-            from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-        except Exception:
-            msg = tk.Label(
-                parent,
-                text="Charts are unavailable in this 32-bit build.",
-                bg=UI.CARD,
-                fg=UI.MUTED,
-                font=UI.FONT_SM,
-            )
-            msg.pack(fill="both", expand=True, pady=(10, 0))
-            return {"fig": None, "ax": None, "canvas": None}
-
-        fig = Figure(figsize=(6.0, 2.35), dpi=100)
-        ax = fig.add_subplot(111)
-        ax.set_facecolor(UI.CARD)
-        fig.patch.set_facecolor(UI.CARD)
-
-        canvas = FigureCanvasTkAgg(fig, master=parent)
-        w = canvas.get_tk_widget()
-        w.configure(bg=UI.CARD, highlightthickness=0)
-        w.pack(fill="both", expand=True, pady=(10, 0))
-        return {"fig": fig, "ax": ax, "canvas": canvas}
+        # Native Tk chart: fast, dependency-free, and works in the 32-bit build.
+        canvas = tk.Canvas(parent, height=235, bg=UI.CARD, highlightthickness=0)
+        canvas.pack(fill="both", expand=True, pady=(10, 0))
+        chart = {"canvas": canvas, "labels": [], "values": [], "ylabel": ""}
+        canvas.bind("<Configure>", lambda _e, c=chart: self._draw_native_line(c), add="+")
+        return chart
 
     def apply_period(self):
         p = self.period_var.get().strip().lower()
@@ -6768,31 +7450,52 @@ class AnalyticsPage(tk.Frame):
         tk.Frame(container, bg=UI.BORDER, height=1).pack(fill="x", pady=1)
 
     def _plot_line(self, chart, labels, values, ylabel):
-        ax = chart["ax"]
-        if ax is None:
+        chart["labels"] = list(labels or [])
+        chart["values"] = [float(v or 0.0) for v in (values or [])]
+        chart["ylabel"] = str(ylabel or "")
+        self._draw_native_line(chart)
+
+    def _draw_native_line(self, chart):
+        canvas = chart.get("canvas")
+        if canvas is None:
             return
-        ax.clear()
-
-        x = list(range(len(values)))
-        ax.plot(x, values)
-
-        ax.set_ylabel(ylabel)
-        ax.grid(True, linewidth=0.4, alpha=0.4)
-
-        ax.spines["top"].set_visible(False)
-        ax.spines["right"].set_visible(False)
-        ax.tick_params(axis="both", labelsize=8)
-
-        if len(labels) <= 12:
-            ax.set_xticks(x)
-            ax.set_xticklabels(labels, rotation=0, fontsize=8)
+        canvas.delete("all")
+        values = list(chart.get("values") or [])
+        labels = list(chart.get("labels") or [])
+        width = max(300, int(canvas.winfo_width() or 300))
+        height = max(170, int(canvas.winfo_height() or 235))
+        left, right, top, bottom = 54, 14, 16, 34
+        plot_w, plot_h = max(1, width - left - right), max(1, height - top - bottom)
+        if not values:
+            canvas.create_text(width / 2, height / 2, text="No sales in this range", fill=UI.MUTED, font=UI.FONT_SM)
+            return
+        low = min(0.0, min(values))
+        high = max(values)
+        if abs(high - low) < 0.001:
+            high = low + 1.0
+        for i in range(5):
+            y = top + (plot_h * i / 4)
+            value = high - ((high - low) * i / 4)
+            canvas.create_line(left, y, width - right, y, fill="#e2e8f0")
+            canvas.create_text(left - 6, y, text=(f"${value:,.0f}" if chart.get("ylabel") != "AOV" else f"${value:,.0f}"),
+                               anchor="e", fill=UI.MUTED, font=("Segoe UI", 8))
+        count = len(values)
+        points = []
+        for i, value in enumerate(values):
+            x = left + (plot_w * i / max(1, count - 1))
+            y = top + ((high - value) / (high - low) * plot_h)
+            points.extend((x, y))
+        if len(points) >= 4:
+            canvas.create_line(*points, fill=UI.PRIMARY, width=3, smooth=(count > 3))
         else:
-            step = max(1, len(labels) // 8)
-            ticks = list(range(0, len(labels), step))
-            ax.set_xticks(ticks)
-            ax.set_xticklabels([labels[i] for i in ticks], rotation=0, fontsize=8)
-
-        chart["canvas"].draw()
+            canvas.create_oval(points[0] - 4, points[1] - 4, points[0] + 4, points[1] + 4, fill=UI.PRIMARY, outline="")
+        step = max(1, count // 6)
+        for i in range(0, count, step):
+            x = left + (plot_w * i / max(1, count - 1))
+            label = str(labels[i] if i < len(labels) else i)
+            if len(label) > 10:
+                label = label[-8:]
+            canvas.create_text(x, height - 12, text=label, fill=UI.MUTED, font=("Segoe UI", 8))
 
     def _product_sort_key(self, row):
         sort = str(self.product_sort_var.get() or "Revenue").lower()
@@ -6938,6 +7641,28 @@ class AnalyticsPage(tk.Frame):
                 font=("Segoe UI", 8, "bold"),
             )
 
+    def open_discount_impact(self):
+        start_date=self.start_var.get().strip(); end_date=self.end_var.get().strip()
+        try: data=analytics_discount_impact(start_date,end_date,250) or {}
+        except Exception as exc: messagebox.showerror("Discount Impact",str(exc),parent=self); return
+        win=tk.Toplevel(self); win.title("Discount Impact"); win.geometry("900x540"); win.minsize(680,420)
+        win.configure(bg=UI.CONTENT_BG); win.transient(self.winfo_toplevel())
+        card=Card(win,padx=14,pady=14); card.pack(fill="both",expand=True,padx=12,pady=12)
+        HeaderBar(card.inner,"Discount Impact",f"{start_date} to {end_date} — products sold below their original value.").pack(fill="x")
+        summary=tk.Frame(card.inner,bg=UI.CARD); summary.pack(fill="x",pady=(10,8))
+        for title,key in [("Before discounts","before_discount"),("After discounts","after_discount"),("Discount given","discount_amount"),("Est. profit after","estimated_profit_after")]:
+            box=tk.Frame(summary,bg="#f8fafc",highlightthickness=1,highlightbackground=UI.BORDER); box.pack(side="left",fill="x",expand=True,padx=(0,8))
+            tk.Label(box,text=title,bg="#f8fafc",fg=UI.MUTED).pack(anchor="w",padx=8,pady=(6,0)); tk.Label(box,text=money(data.get(key,0)),bg="#f8fafc",fg=UI.TEXT,font=("Segoe UI",11,"bold")).pack(anchor="w",padx=8,pady=(0,6))
+        cols=("product","qty","before","discount","after","profit")
+        tree=ttk.Treeview(card.inner,columns=cols,show="headings",height=15)
+        for col,title,width in [("product","Product",260),("qty","Qty",55),("before","Before",90),("discount","Discount",90),("after","After",90),("profit","Est. profit",90)]:
+            tree.heading(col,text=title); tree.column(col,width=width,anchor=("w" if col=="product" else "e"))
+        tree.pack(fill="both",expand=True)
+        for idx,row in enumerate(data.get("items") or []):
+            after=float(row_get(row,"after_discount",0) or 0); cost=float(row_get(row,"estimated_cost",0) or 0)
+            tree.insert("",tk.END,iid=str(idx),values=(row_get(row,"name",""),row_get(row,"qty",0),money(row_get(row,"before_discount",0)),money(row_get(row,"discount_amount",0)),money(after),money(after-cost)))
+        GhostButton(card.inner,"Close",win.destroy).pack(anchor="e",pady=(8,0))
+
     def refresh(self):
         start_date = self.start_var.get().strip()
         end_date = self.end_var.get().strip()
@@ -6946,10 +7671,11 @@ class AnalyticsPage(tk.Frame):
         self.last_refresh_lbl.config(text=f"Last refreshed: {fmt_time_ampm(datetime.now())}")
 
         k = analytics_kpis_range(start_date, end_date)
-        self.kpi_gross.config(text=money(k.get("gross_sales", 0)))
-        self.kpi_orders.config(text=str(k.get("orders", 0)))
+        self.kpi_gross.config(text=money(k.get("net_sales", 0)))
+        self.kpi_cash.config(text=money(k.get("cash_sales_total", 0)))
         self.kpi_items.config(text=str(k.get("items_sold", 0)))
         self.kpi_aov.config(text=money(k.get("avg_order_value", 0)))
+        self.range_lbl.config(text=f"{start_date} to {end_date}  |  {int(k.get('orders', 0) or 0)} orders")
 
         for w in self.breakdown_box.winfo_children():
             w.destroy()
@@ -6980,13 +7706,16 @@ class AnalyticsPage(tk.Frame):
         tax = float(b.get("taxes", 0) or 0.0)
         total = float(b.get("total_sales", (net + ship + tax)) or 0.0)
 
-        self._breakdown_row("Gross sales", gs)
-        self._breakdown_row("Discounts", disc)
-        self._breakdown_row("Returns", ret)
-        self._breakdown_row("Net sales", net, bold=True)
-        self._breakdown_row("Shipping charges", ship)
-        self._breakdown_row("Taxes", tax)
+        self._breakdown_row("Item value before discounts", gs)
+        if disc > 0.005:
+            self._breakdown_row("Discounts", -disc)
+        self._breakdown_row("Sales after discounts", net + ret)
+        if ret > 0.005:
+            self._breakdown_row("Returns", -ret)
         self._breakdown_row("Total sales", total, bold=True)
+        if float(k.get("cogs", 0) or 0.0) > 0.005:
+            self._breakdown_row("Product cost entered", -float(k.get("cogs", 0) or 0.0))
+            self._breakdown_row("Gross profit", float(k.get("gross_profit", 0) or 0.0), bold=True)
 
         for w in self.pm_breakdown_box.winfo_children():
             w.destroy()
@@ -7026,7 +7755,8 @@ class AnalyticsPage(tk.Frame):
         labels = [str(p.get("label","")) for p in series if isinstance(p, dict)]
         revs = [float((p.get("revenue") or 0.0)) for p in series if isinstance(p, dict)]
         orders = [int((p.get("orders") or 0)) for p in series if isinstance(p, dict)]
-        aov = [(revs[i] / orders[i]) if orders[i] > 0 else 0.0 for i in range(len(series))]
+        order_sales = [float((p.get("order_value_sales") or p.get("revenue") or 0.0)) for p in series if isinstance(p, dict)]
+        aov = [(order_sales[i] / orders[i]) if orders[i] > 0 else 0.0 for i in range(len(series))]
 
         self._plot_line(self.sales_chart, labels, revs, "Sales")
         self._plot_line(self.aov_chart, labels, aov, "AOV")
@@ -7721,6 +8451,7 @@ class ShiftsPage(tk.Frame):
         self.sales_month = tk.StringVar(value=f"{today.month:02d}")
         self.sales_day = tk.StringVar(value=f"{today.day:02d}")
         self.reprint_var = tk.StringVar(value="")  # Sale ID / receipt scan for reprint
+        self.show_voided_var = tk.BooleanVar(value=False)
         self._last_lookup_sale_id = None
         self._build()
 
@@ -7760,6 +8491,8 @@ class ShiftsPage(tk.Frame):
 
         self.emp_cb = ttk.Combobox(emp_row, textvariable=self.employee_var, values=[], state="readonly", width=18)
         self.emp_cb.pack(side="left", padx=(0, 8))
+        self._preferred_employee = ""
+        self.emp_cb.bind("<<ComboboxSelected>>", self._remember_employee_selection)
 
         GhostButton(emp_row, "Add employee", self.add_employee_popup).pack(side="left")
         GhostButton(emp_row, "Remove employee", self.remove_employee_popup).pack(side="left", padx=(8, 0))
@@ -7893,7 +8626,11 @@ class ShiftsPage(tk.Frame):
                                                                                                     padx=(0, 10))
         GhostButton(top, "Load", self.load_day).pack(side="left")
         GhostButton(top, "Today", self.set_today).pack(side="left", padx=8)
-        DangerButton(top, "Delete Sale", self.delete_selected_sale).pack(side="left")
+        DangerButton(top, "Void Sale", self.delete_selected_sale).pack(side="left")
+        ttk.Checkbutton(
+            top, text="Show voided", variable=self.show_voided_var,
+            command=lambda: self.load_day(silent=True),
+        ).pack(side="left", padx=(8, 0))
 
         rep = tk.Frame(right.inner, bg=UI.CARD)
         rep.pack(fill="x", pady=(0, 10))
@@ -7901,8 +8638,10 @@ class ShiftsPage(tk.Frame):
         ent = tk.Entry(rep, textvariable=self.reprint_var, bd=1, relief="solid", width=28)
         ent.pack(side="left", padx=8)
         PrimaryButton(rep, "Reprint Receipt", self.reprint_receipt_clicked).pack(side="left")
+        GhostButton(rep, "Gift Receipt", self.reprint_gift_receipt_clicked).pack(side="left", padx=(8, 0))
         GhostButton(rep, "View Details", self.view_details_clicked).pack(side="left", padx=8)
         GhostButton(rep, "Find", self.lookup_sale_clicked).pack(side="left")
+        GhostButton(rep, "Search All", self.open_sales_search).pack(side="left", padx=(8, 0))
         ent.bind("<Return>", lambda e: self.lookup_sale_clicked())
 
         cols = ("receipt", "time", "total", "pay", "shift")
@@ -7918,6 +8657,7 @@ class ShiftsPage(tk.Frame):
         self.sales_tree.column("pay", width=80, anchor="center")
         self.sales_tree.column("shift", width=70, anchor="center")
         self.sales_tree.pack(fill="both", expand=True)
+        self.sales_tree.tag_configure("voided", foreground="#991b1b", background="#fee2e2")
 
         self.sales_tree.bind("<Double-1>", self.open_sale_detail)
 
@@ -7986,8 +8726,15 @@ class ShiftsPage(tk.Frame):
         self.emp_cb["values"] = names
         current = self.employee_var.get().strip()
         if current and current in names:
+            self._preferred_employee = current
             return
-        self.employee_var.set(names[0] if names else "")
+        preferred = str(getattr(self, "_preferred_employee", "") or "").strip()
+        self.employee_var.set(preferred if preferred in names else (names[0] if names else ""))
+
+    def _remember_employee_selection(self, _event=None):
+        selected = self.employee_var.get().strip()
+        if selected:
+            self._preferred_employee = selected
 
     def _set_drawer_metric(self, key: str, value: str, fg=None):
         lbl = getattr(self, "drawer_metric_labels", {}).get(key)
@@ -8590,9 +9337,10 @@ class ShiftsPage(tk.Frame):
             except Exception as e:
                 messagebox.showerror("Error", f"{type(e).__name__}: {e}")
                 return
+            self._preferred_employee = name
+            self.employee_var.set(name)
             win.destroy()
             self.refresh_all()
-            self.employee_var.set(name)
 
         btns = tk.Frame(box.inner, bg=UI.CARD)
         btns.pack(fill="x", pady=(10, 0))
@@ -9411,7 +10159,7 @@ class ShiftsPage(tk.Frame):
 
         self.sales_tree.delete(*self.sales_tree.get_children())
 
-        rows = list_sales_for_day(day, limit=1000)
+        rows = list_sales_for_day(day, limit=1000, include_voided=bool(self.show_voided_var.get()))
 
         # Drawer cash is new physical cash collected. Display amount is the sale amount
         # so Whish/Card rows do not look like $0 sales.
@@ -9421,6 +10169,7 @@ class ShiftsPage(tk.Frame):
         cash_out_sum = 0.0
 
         for r in rows:
+            is_voided = bool(int(row_get(r, "is_voided", 0) or 0))
             pm = str(row_get(r, "payment_method", "") or "").strip().upper()
             cash_paid_val = row_get(r, "cash_paid", None)
             total_val = float(row_get(r, "total_amount", 0) or 0)
@@ -9450,9 +10199,11 @@ class ShiftsPage(tk.Frame):
                         paid = float(cash_paid_val or 0)
                     except Exception:
                         paid = float(total_val or 0)
-            net_total_sum += paid
+            if not is_voided:
+                net_total_sum += paid
             display_amount = sale_display_amount(r)
-            displayed_sales_sum += display_amount
+            if not is_voided:
+                displayed_sales_sum += display_amount
 
             t = row_get(r, "created_at", "")
             try:
@@ -9464,11 +10215,14 @@ class ShiftsPage(tk.Frame):
             receipt_code = (row_get(r, "receipt_code", "") or "").strip()
             if not receipt_code:
                 receipt_code = str(int(row_get(r, "id", 0) or 0))
+            if is_voided:
+                receipt_code = f"VOID {receipt_code}"
 
             self.sales_tree.insert(
                 "",
                 tk.END,
                 iid=str(int(row_get(r, "id", 0) or 0)),
+                tags=(("voided",) if is_voided else ()),
                 values=(
                     receipt_code,
                     t_disp,
@@ -9543,7 +10297,7 @@ class ShiftsPage(tk.Frame):
 
         self.day_total_lbl.config(
             text=(
-                f"Sales total: {money(displayed_sales_sum)}   |   Cash collected: {money(net_total_sum)}   |   Sales: {len(rows)}\n"
+                f"Sales total: {money(displayed_sales_sum)}   |   Cash collected: {money(net_total_sum)}   |   Active sales: {sum(1 for r in rows if not bool(int(row_get(r, 'is_voided', 0) or 0)))}\n"
                 f"Cash in: {money(cash_in_sum)}   |   Cash out: {money(cash_out_sum)}\n"
                 f"Drawer net: {money(net_total_sum + cash_in_sum - cash_out_sum)}   |   "
                 f"Cash in register: {money(cash_in_register)}"
@@ -9565,25 +10319,40 @@ class ShiftsPage(tk.Frame):
 
         iid = str(sel[0])
         if not iid.isdigit():
-            messagebox.showinfo("Delete sale", "Cash drawer movement records are kept for drawer history and cannot be deleted here.")
+            messagebox.showinfo("Void sale", "Cash drawer movement records cannot be voided from this list.")
             return
 
         sale_id = int(iid)
         receipt_code = vals[0] if len(vals) > 0 else str(sale_id)
 
-        if not messagebox.askyesno("Delete sale",
-                                   f"Delete sale {receipt_code}?\n\nThis will restore stock for the items."):
+        sale, _items = get_sale_detail(sale_id)
+        if sale and bool(int(row_get(sale, "is_voided", 0) or 0)):
+            messagebox.showinfo("Void sale", "This sale is already voided.")
+            return
+
+        reason = simpledialog.askstring(
+            "Void Sale",
+            f"Why are you voiding sale {receipt_code}?\n\nThe sale will remain visible in Show voided and its stock will be restored.",
+            parent=self,
+        )
+        if reason is None:
+            return
+        reason = reason.strip()
+        if not reason:
+            messagebox.showerror("Void Sale", "Enter a reason so the void has a useful audit record.")
+            return
+        if not messagebox.askyesno("Confirm Void", f"Void sale {receipt_code} and restore its stock?", parent=self):
             return
 
         try:
-            delete_sale(sale_id, restore_stock=True)
+            void_sale(sale_id, reason, self.employee_var.get().strip(), restore_stock=True)
         except Exception as e:
             messagebox.showerror("Error", f"{type(e).__name__}: {e}")
             return
 
         self.load_day(silent=True)
         self.refresh_all()
-        messagebox.showinfo("Deleted", f"Sale #{sale_id} deleted and stock restored.")
+        messagebox.showinfo("Voided", f"Sale #{sale_id} was voided, kept in history, and its stock was restored.")
 
     # FIXED: indentation + no stray try/labels outside function
     def open_sale_detail(self, event=None):
@@ -9614,6 +10383,16 @@ class ShiftsPage(tk.Frame):
         box.pack(fill="both", expand=True, padx=14, pady=14)
 
         tk.Label(box.inner, text=f"Sale {receipt_code}", font=UI.FONT_LG, bg=UI.CARD, fg=UI.TEXT).pack(anchor="w")
+        if bool(int(row_get(sale, "is_voided", 0) or 0)):
+            tk.Label(
+                box.inner,
+                text=(
+                    f"VOIDED {row_get(sale, 'voided_at', '')} by {row_get(sale, 'voided_by', '') or 'Unassigned'}\n"
+                    f"Reason: {row_get(sale, 'void_reason', '') or 'No reason recorded'}"
+                ),
+                bg="#fee2e2", fg="#991b1b", justify="left", anchor="w",
+                font=("Segoe UI", 10, "bold"),
+            ).pack(fill="x", pady=(6, 8), ipady=6, ipadx=8)
 
         # Calculate returned value from the actual return records. This matters
         # for exchange sales where store credit reduced the amount actually paid.
@@ -9751,6 +10530,44 @@ class ShiftsPage(tk.Frame):
                 return None
         return None
 
+    def open_sales_search(self):
+        win=tk.Toplevel(self); win.title("Search All Sales"); win.geometry("980x560"); win.minsize(720,430)
+        win.configure(bg=UI.CONTENT_BG); win.transient(self.winfo_toplevel())
+        card=Card(win,padx=14,pady=14); card.pack(fill="both",expand=True,padx=12,pady=12)
+        HeaderBar(card.inner,"Search All Sales","Search every date by receipt, product, barcode, employee, or payment method.").pack(fill="x")
+        top=tk.Frame(card.inner,bg=UI.CARD); top.pack(fill="x",pady=(10,8))
+        query=tk.StringVar(value=""); include_voided=tk.BooleanVar(value=True)
+        entry=tk.Entry(top,textvariable=query,bd=1,relief="solid"); entry.pack(side="left",fill="x",expand=True,ipady=4)
+        ttk.Checkbutton(top,text="Include voided",variable=include_voided).pack(side="left",padx=10)
+        cols=("receipt","date","total","pay","employee","status","items")
+        tree=ttk.Treeview(card.inner,columns=cols,show="headings",height=16)
+        for col,title,width in [("receipt","Receipt",85),("date","Date / time",145),("total","Total",85),("pay","Payment",90),("employee","Employee",100),("status","Status",65),("items","Items",300)]:
+            tree.heading(col,text=title); tree.column(col,width=width,anchor=("e" if col=="total" else "w"))
+        tree.pack(fill="both",expand=True); tree.tag_configure("voided",foreground="#991b1b",background="#fee2e2")
+        rows_by_id={}
+        def load():
+            try: rows=search_sales(query.get().strip(),bool(include_voided.get()),500) or []
+            except Exception as exc: messagebox.showerror("Sales search",str(exc),parent=win); return
+            tree.delete(*tree.get_children()); rows_by_id.clear()
+            for row in rows:
+                sid=int(row_get(row,"id",0) or 0); rows_by_id[str(sid)]=row
+                voided=bool(int(row_get(row,"is_voided",0) or 0))
+                tree.insert("",tk.END,iid=str(sid),tags=(("voided",) if voided else ()),values=(row_get(row,"receipt_code","") or sid,row_get(row,"created_at",""),money(sale_display_amount(row)),payment_method_label(row_get(row,"payment_method","")),row_get(row,"employee_name",""),"VOID" if voided else "Active",row_get(row,"item_names","") or ""))
+        def open_selected():
+            sel=tree.selection()
+            if not sel: messagebox.showinfo("Sales search","Select a sale first.",parent=win); return
+            sid=sel[0]; row=rows_by_id.get(sid,{})
+            created=str(row_get(row,"created_at","") or "")
+            if len(created)>=10: self.date_var.set(created[:10])
+            if bool(int(row_get(row,"is_voided",0) or 0)): self.show_voided_var.set(True)
+            self.load_day(silent=True); self.reprint_var.set(str(row_get(row,"receipt_code","") or sid)); self._last_lookup_sale_id=int(sid)
+            if sid in self.sales_tree.get_children(): self.sales_tree.selection_set(sid); self.sales_tree.focus(sid); self.sales_tree.see(sid)
+            self.open_sale_detail()
+        PrimaryButton(top,"Search",load).pack(side="left")
+        btn=tk.Frame(card.inner,bg=UI.CARD); btn.pack(fill="x",pady=(8,0))
+        PrimaryButton(btn,"View Selected",open_selected).pack(side="left"); GhostButton(btn,"Close",win.destroy).pack(side="right")
+        entry.bind("<Return>",lambda _e: load()); tree.bind("<Double-1>",lambda _e: open_selected()); entry.focus_set(); load()
+
     def lookup_sale_clicked(self):
         raw = self.reprint_var.get().strip()
         sale_id = self._resolve_sale_id_from_input(raw)
@@ -9816,12 +10633,38 @@ class ShiftsPage(tk.Frame):
             return
 
         try:
-            pdf_path = str(create_temp_receipt_pdf("Mask POS", sale, items))
-            ok = open_pdf_in_chrome(pdf_path)
+            ok = bool(print_configured_receipt(get_store_name(), sale, items))
             if not ok:
-                messagebox.showwarning("Print", "Could not open PDF in Chrome. Check Chrome path in app.py.")
+                messagebox.showwarning("Print", "Receipt was not sent. Check Settings > Receipt Printer and use Test Print.")
         except Exception as e:
             messagebox.showerror("Print", f"{type(e).__name__}: {e}")
+
+    def reprint_gift_receipt_clicked(self):
+        sale_id = None
+        sel = self.sales_tree.selection()
+        if sel and str(sel[0]).isdigit():
+            sale_id = int(sel[0])
+        if sale_id is None:
+            sale_id = self._resolve_sale_id_from_input(self.reprint_var.get()) or self._last_lookup_sale_id
+        if sale_id is None:
+            messagebox.showinfo("Gift receipt", "Select a sale or enter a Sale ID / receipt scan first.")
+            return
+        sale, items = get_sale_detail_with_returns(int(sale_id))
+        if not sale:
+            messagebox.showerror("Missing", "Sale not found.")
+            return
+        selected = self.winfo_toplevel().cashier_page._select_gift_items(items)
+        if selected is None:
+            return
+        if not selected:
+            messagebox.showinfo("Gift receipt", "Select at least one item.")
+            return
+        try:
+            ok = bool(print_configured_gift_receipt(get_store_name(), sale, selected))
+            if not ok:
+                messagebox.showwarning("Print", "Gift receipt was not sent. Check Settings > Receipt Printer and use Test Print.")
+        except Exception as exc:
+            messagebox.showerror("Print", str(exc))
 
     def view_details_clicked(self):
         # Prefer currently selected row
@@ -11340,8 +12183,6 @@ class SettingsPage(tk.Frame):
         # -------- Connection --------
         cfg = get_backend_config()
         saved_mode = cfg.get("mode", "standalone")
-        if saved_mode == "cloud" and not supabase_emergency_enabled():
-            saved_mode = "host"
         self.mode_var = tk.StringVar(value=saved_mode)
         self.url_var = tk.StringVar(value=cfg.get("server_url", "http://127.0.0.1:8000"))
         self.port_var = tk.StringVar(value=str(cfg.get("host_port", 8000)))
@@ -11356,9 +12197,8 @@ class SettingsPage(tk.Frame):
             anchor="w", pady=2)
         ttk.Radiobutton(rb, text="Join (use the Host main database)", value="connect", variable=self.mode_var).pack(anchor="w",
                                                                                                             pady=2)
-        if supabase_emergency_enabled():
-            ttk.Radiobutton(rb, text="Cloud Cache fallback (use only if Host is unavailable)", value="cloud",
-                            variable=self.mode_var).pack(anchor="w", pady=2)
+        ttk.Radiobutton(rb, text="Cloud (hosted sync with local offline cache)", value="cloud",
+                        variable=self.mode_var).pack(anchor="w", pady=2)
 
         tk.Label(body.inner, text="Host Port (Host mode)", font=UI.FONT_SM, bg=UI.CARD, fg=UI.MUTED).pack(anchor="w",
                                                                                                           pady=(10, 2))
@@ -11485,8 +12325,7 @@ class SettingsPage(tk.Frame):
                  font=UI.FONT_SM, bg=UI.CARD, fg=UI.MUTED).pack(anchor="w", pady=(6, 0))
 
         cloud_row = tk.Frame(body.inner, bg=UI.CARD)
-        if supabase_emergency_enabled():
-            cloud_row.pack(anchor="w", fill="x", pady=(10, 0))
+        cloud_row.pack(anchor="w", fill="x", pady=(10, 0))
         self.cloud_status_var = tk.StringVar(value="")
 
         def sync_cloud_now():
@@ -11516,10 +12355,11 @@ class SettingsPage(tk.Frame):
             except Exception as e:
                 self.cloud_status_var.set(f"Cloud sync failed: {e}")
 
-        if supabase_emergency_enabled():
-            ttk.Button(cloud_row, text="Sync Cloud Now", command=sync_cloud_now).pack(side="left")
-            tk.Label(cloud_row, textvariable=self.cloud_status_var, bg=UI.CARD, fg=UI.MUTED, wraplength=620,
-                     justify="left").pack(side="left", padx=(10, 0))
+        ttk.Button(cloud_row, text="Sync Cloud Now", command=sync_cloud_now).pack(side="left")
+        tk.Label(cloud_row, textvariable=self.cloud_status_var, bg=UI.CARD, fg=UI.MUTED, wraplength=620,
+                 justify="left").pack(side="left", padx=(10, 0))
+        if not supabase_emergency_enabled():
+            self.cloud_status_var.set("Cloud configuration is missing on this PC. Cloud mode remains available but cannot sync yet.")
 
         hint = tk.Label(
             body.inner,
@@ -13645,6 +14485,541 @@ def _start_host_server_if_needed() -> None:
     except Exception:
         # Never block app startup because of server issues
         return
+
+
+class DataHealthPage(tk.Frame):
+    def __init__(self, parent):
+        super().__init__(parent, bg=UI.CONTENT_BG)
+        self._build()
+        self.refresh()
+
+    def _build(self):
+        scroll = VScrollableFrame(self, bg=UI.CONTENT_BG)
+        scroll.pack(fill="both", expand=True)
+        wrap = tk.Frame(scroll.inner, bg=UI.CONTENT_BG)
+        wrap.pack(fill="both", expand=True, padx=(10 if UI.COMPACT else 18), pady=(10 if UI.COMPACT else 18))
+
+        header = Card(wrap, padx=18, pady=14)
+        header.pack(fill="x")
+        HeaderBar(header.inner, "Data Health & Tools", "Audit catalog anomalies, repair broken links, and import clean CSV data.").pack(fill="x")
+
+        stats_frame = tk.Frame(wrap, bg=UI.CONTENT_BG)
+        stats_frame.pack(fill="x", pady=12)
+        for i in range(5):
+            stats_frame.grid_columnconfigure(i, weight=1)
+
+        self.stat_cards = {}
+        
+        def make_stat_card(parent, title, key, col, color):
+            card = Card(parent, padx=12, pady=12)
+            card.grid(row=0, column=col, sticky="nsew", padx=(0 if col == 0 else 6, 0 if col == 4 else 6))
+            
+            lbl_title = tk.Label(card.inner, text=title, font=UI.FONT_SM, bg=UI.CARD, fg=UI.MUTED)
+            lbl_title.pack(anchor="w")
+            
+            val_var = tk.StringVar(value="0")
+            lbl_val = tk.Label(card.inner, textvariable=val_var, font=("Segoe UI", 20, "bold"), bg=UI.CARD, fg=color)
+            lbl_val.pack(anchor="w", pady=(4, 0))
+            
+            card.inner.bind("<Button-1>", lambda e: self.select_issue_type(key))
+            lbl_title.bind("<Button-1>", lambda e: self.select_issue_type(key))
+            lbl_val.bind("<Button-1>", lambda e: self.select_issue_type(key))
+            
+            self.stat_cards[key] = (val_var, card)
+            
+        make_stat_card(stats_frame, "Negative Stock", "negative_stock", 0, "#ef4444")
+        make_stat_card(stats_frame, "Missing Category", "missing_category", 1, "#f59e0b")
+        make_stat_card(stats_frame, "Missing Location", "missing_location", 2, "#3b82f6")
+        make_stat_card(stats_frame, "Duplicate Names", "duplicate_names", 3, "#8b5cf6")
+        make_stat_card(stats_frame, "Broken History Links", "broken_links", 4, "#ec4899")
+
+        self.issue_section = Card(wrap, padx=14, pady=14)
+        self.issue_section.pack(fill="both", expand=True, pady=(6, 0))
+
+        sec_title_row = tk.Frame(self.issue_section.inner, bg=UI.CARD)
+        sec_title_row.pack(fill="x", pady=(0, 10))
+        
+        self.issue_title_lbl = tk.Label(sec_title_row, text="Audit Details", font=UI.FONT_LG, bg=UI.CARD, fg=UI.TEXT)
+        self.issue_title_lbl.pack(side="left")
+
+        table_frame = tk.Frame(self.issue_section.inner, bg=UI.CARD)
+        table_frame.pack(fill="both", expand=True)
+
+        cols = ("id", "name", "barcode", "category", "brand", "location", "stock", "low_stock")
+        self.issue_tree = ttk.Treeview(table_frame, columns=cols, show="headings", height=8, selectmode="extended")
+        
+        for col, title, width in [
+            ("id", "ID", 60), ("name", "Name", 200), ("barcode", "Barcode", 130),
+            ("category", "Category", 120), ("brand", "Brand", 100), ("location", "Location", 100),
+            ("stock", "Stock", 80), ("low_stock", "Low stock", 80)
+        ]:
+            self.issue_tree.heading(col, text=title)
+            self.issue_tree.column(col, width=width, anchor="center" if col in ("stock", "low_stock") else "w")
+
+        vsb = ttk.Scrollbar(table_frame, orient="vertical", command=self.issue_tree.yview)
+        self.issue_tree.configure(yscrollcommand=vsb.set)
+        self.issue_tree.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="right", fill="y")
+
+        self.controls_panel = tk.Frame(self.issue_section.inner, bg=UI.CARD)
+        self.controls_panel.pack(fill="x", pady=(12, 0))
+
+        self.bulk_edit_frame = tk.Frame(self.controls_panel, bg=UI.CARD)
+        self.repair_frame = tk.Frame(self.controls_panel, bg=UI.CARD)
+
+        tk.Label(self.bulk_edit_frame, text="Bulk Edit Selected:", font=UI.FONT_MD, bg=UI.CARD, fg=UI.TEXT).grid(row=0, column=0, sticky="w", pady=(0, 6), columnspan=4)
+        
+        tk.Label(self.bulk_edit_frame, text="Category", bg=UI.CARD, fg="#334155").grid(row=1, column=0, sticky="w", padx=(0, 4))
+        self.bulk_cat_cb = ttk.Combobox(self.bulk_edit_frame, width=16, values=[], state="normal")
+        self.bulk_cat_cb.grid(row=1, column=1, sticky="w", padx=(0, 12))
+        
+        tk.Label(self.bulk_edit_frame, text="Location", bg=UI.CARD, fg="#334155").grid(row=1, column=2, sticky="w", padx=(0, 4))
+        self.bulk_loc_e = tk.Entry(self.bulk_edit_frame, width=14, bd=1, relief="solid")
+        self.bulk_loc_e.grid(row=1, column=3, sticky="w", padx=(0, 12))
+        
+        tk.Label(self.bulk_edit_frame, text="Low stock level", bg=UI.CARD, fg="#334155").grid(row=1, column=4, sticky="w", padx=(0, 4))
+        self.bulk_low_e = tk.Entry(self.bulk_edit_frame, width=8, bd=1, relief="solid")
+        self.bulk_low_e.grid(row=1, column=5, sticky="w", padx=(0, 12))
+
+        tk.Label(self.bulk_edit_frame, text="Brand", bg=UI.CARD, fg="#334155").grid(row=1, column=6, sticky="w", padx=(0, 4))
+        self.bulk_brand_e = tk.Entry(self.bulk_edit_frame, width=14, bd=1, relief="solid")
+        self.bulk_brand_e.grid(row=1, column=7, sticky="w", padx=(0, 12))
+
+        PrimaryButton(self.bulk_edit_frame, "Apply Bulk Edit", self.apply_bulk_edit).grid(row=1, column=8, sticky="w", padx=(10, 0))
+
+        tk.Label(self.repair_frame, text="Broken History Link Repair Tools:", font=UI.FONT_MD, bg=UI.CARD, fg=UI.TEXT).pack(anchor="w", pady=(0, 6))
+        GhostButton(self.repair_frame, "Map Selected to Valid Product", self.open_map_repair_dialog).pack(side="left")
+        GhostButton(self.repair_frame, "Recreate and Repair Link", self.open_recreate_repair_dialog).pack(side="left", padx=(10, 0))
+
+        import_card = Card(wrap, padx=14, pady=14)
+        import_card.pack(fill="x", pady=(14, 0))
+
+        tk.Label(import_card.inner, text="Excel/CSV Product Importer", font=UI.FONT_LG, bg=UI.CARD, fg=UI.TEXT).pack(anchor="w")
+        tk.Label(import_card.inner, text="Upload sheet containing: Barcode, Name, Sell price, Cost price, Stock qty, Category, Brand, Location, Low stock.",
+                 font=UI.FONT_SM, bg=UI.CARD, fg=UI.MUTED).pack(anchor="w", pady=(2, 10))
+        
+        btn_import_row = tk.Frame(import_card.inner, bg=UI.CARD)
+        btn_import_row.pack(fill="x")
+        PrimaryButton(btn_import_row, "Select Import File (CSV)", self.select_import_file).pack(side="left")
+        self.lbl_import_status = tk.Label(btn_import_row, text="No file loaded.", bg=UI.CARD, fg=UI.MUTED)
+        self.lbl_import_status.pack(side="left", padx=12)
+
+        self.preview_frame = tk.Frame(import_card.inner, bg=UI.CARD)
+        
+        self.lbl_preview_title = tk.Label(self.preview_frame, text="Import Sheet Preview & Validation (Red rows indicate errors):", font=UI.FONT_MD, bg=UI.CARD, fg=UI.TEXT)
+        self.lbl_preview_title.pack(anchor="w", pady=(10, 6))
+
+        preview_table_frame = tk.Frame(self.preview_frame, bg=UI.CARD)
+        preview_table_frame.pack(fill="x")
+        
+        self.preview_tree = ttk.Treeview(preview_table_frame, columns=("row", "barcode", "name", "price", "cost", "stock", "category", "brand", "location", "low_stock", "error"), show="headings", height=5)
+        for col, title, width in [
+            ("row", "Row", 40), ("barcode", "Barcode", 110), ("name", "Name", 150),
+            ("price", "Sell price", 80), ("cost", "Cost price", 80), ("stock", "Stock", 65),
+            ("category", "Category", 90), ("brand", "Brand", 80), ("location", "Location", 80),
+            ("low_stock", "Low stock", 70), ("error", "Validation error", 180)
+        ]:
+            self.preview_tree.heading(col, text=title)
+            self.preview_tree.column(col, width=width)
+        
+        preview_vsb = ttk.Scrollbar(preview_table_frame, orient="vertical", command=self.preview_tree.yview)
+        self.preview_tree.configure(yscrollcommand=preview_vsb.set)
+        self.preview_tree.pack(side="left", fill="x", expand=True)
+        preview_vsb.pack(side="right", fill="y")
+        
+        self.btn_commit_import = PrimaryButton(self.preview_frame, "Commit Import Data", self.commit_import)
+        self.btn_commit_import.pack(anchor="w", pady=(10, 0))
+
+        self.loaded_import_items = []
+        self.active_issue_type = None
+
+    def refresh(self):
+        stats = get_data_health_stats()
+        for key, (var, card) in self.stat_cards.items():
+            count = stats.get(key, 0)
+            var.set(str(count))
+            if self.active_issue_type == key:
+                card.configure(highlightbackground=UI.PRIMARY, highlightthickness=2)
+            else:
+                card.configure(highlightbackground=UI.CARD, highlightthickness=0)
+                
+        try:
+            cats = get_distinct_categories() or []
+            self.bulk_cat_cb['values'] = cats
+        except Exception:
+            pass
+
+        if self.active_issue_type:
+            self.select_issue_type(self.active_issue_type)
+        else:
+            self.select_issue_type("negative_stock")
+
+    def select_issue_type(self, key):
+        self.active_issue_type = key
+        for k, (var, card) in self.stat_cards.items():
+            if k == key:
+                card.configure(highlightbackground=UI.PRIMARY, highlightthickness=2)
+            else:
+                card.configure(highlightbackground=UI.CARD, highlightthickness=0)
+                
+        self.issue_tree.delete(*self.issue_tree.get_children())
+        
+        if key == "broken_links":
+            self.issue_tree.heading("id", text="Item ID")
+            self.issue_tree.heading("name", text="Description")
+            self.issue_tree.heading("barcode", text="Barcode")
+            self.issue_tree.heading("category", text="Category")
+            self.issue_tree.heading("brand", text="Brand")
+            self.issue_tree.heading("location", text="Location")
+            self.issue_tree.heading("stock", text="Occurrences")
+            self.issue_tree.heading("low_stock", text="Linked ID")
+            
+            issues = list_health_issues("broken_links")
+            for r in issues:
+                self.issue_tree.insert("", tk.END, iid=str(row_get(r, "item_ids", "")), values=(
+                    "MULTIPLE",
+                    row_get(r, "name", ""),
+                    row_get(r, "product_barcode", ""),
+                    "", "", "",
+                    row_get(r, "occurrence_count", 0),
+                    "BROKEN"
+                ))
+            self.issue_title_lbl.config(text="Audit: Broken History Links (Sale items whose product records were deleted)")
+            
+            self.bulk_edit_frame.pack_forget()
+            self.repair_frame.pack(fill="x")
+        else:
+            self.issue_tree.heading("id", text="ID")
+            self.issue_tree.heading("name", text="Product name")
+            self.issue_tree.heading("barcode", text="Barcode")
+            self.issue_tree.heading("category", text="Category")
+            self.issue_tree.heading("brand", text="Brand")
+            self.issue_tree.heading("location", text="Location")
+            self.issue_tree.heading("stock", text="Stock")
+            self.issue_tree.heading("low_stock", text="Low stock")
+            
+            issues = list_health_issues(key)
+            for r in issues:
+                self.issue_tree.insert("", tk.END, iid=str(row_get(r, "id", "")), values=(
+                    row_get(r, "id", ""),
+                    row_get(r, "name", ""),
+                    row_get(r, "barcode", ""),
+                    row_get(r, "category", ""),
+                    row_get(r, "brand", ""),
+                    row_get(r, "location", ""),
+                    row_get(r, "stock_qty", 0),
+                    row_get(r, "low_stock_level", 0)
+                ))
+            
+            titles = {
+                "negative_stock": "Audit: Products with Negative Stock Levels",
+                "missing_category": "Audit: Products missing Category classification",
+                "missing_location": "Audit: Products missing Location location / section assignment",
+                "duplicate_names": "Audit: Product records sharing duplicate Name identifiers"
+            }
+            self.issue_title_lbl.config(text=titles.get(key, "Audit Details"))
+            
+            self.repair_frame.pack_forget()
+            self.bulk_edit_frame.pack(fill="x")
+
+    def apply_bulk_edit(self):
+        sel = self.issue_tree.selection()
+        if not sel:
+            messagebox.showwarning("Select", "Select one or more items in the table first.")
+            return
+            
+        category = self.bulk_cat_cb.get().strip() or None
+        location = self.bulk_loc_e.get().strip() or None
+        brand = self.bulk_brand_e.get().strip() or None
+        
+        low_stock = None
+        low_val = self.bulk_low_e.get().strip()
+        if low_val:
+            try:
+                low_stock = int(low_val)
+            except Exception:
+                messagebox.showerror("Invalid", "Low stock level must be a number.")
+                return
+                
+        if category is None and location is None and low_stock is None and brand is None:
+            messagebox.showinfo("Incomplete", "Fill at least one field to edit in bulk.")
+            return
+            
+        product_ids = [int(iid) for iid in sel]
+        ok = bulk_update_products(product_ids, category=category, location=location, low_stock=low_stock, brand=brand)
+        if ok:
+            messagebox.showinfo("Success", f"Bulk updated {len(product_ids)} products successfully.")
+            self.bulk_cat_cb.set("")
+            self.bulk_loc_e.delete(0, tk.END)
+            self.bulk_low_e.delete(0, tk.END)
+            self.bulk_brand_e.delete(0, tk.END)
+            self.refresh()
+        else:
+            messagebox.showerror("Error", "Failed to apply bulk edit.")
+
+    def open_map_repair_dialog(self):
+        sel = self.issue_tree.selection()
+        if not sel:
+            messagebox.showwarning("Select", "Select a broken sale item group to map.")
+            return
+            
+        item_ids_str = sel[0]
+        vals = self.issue_tree.item(item_ids_str, "values")
+        broken_name = vals[1]
+        
+        win = tk.Toplevel(self)
+        win.title("Repair Link: Map to Product")
+        win.geometry("500x200")
+        win.configure(bg=UI.CONTENT_BG)
+        win.transient(self.winfo_toplevel())
+        win.grab_set()
+        
+        card = Card(win, padx=14, pady=14)
+        card.pack(fill="both", expand=True, padx=10, pady=10)
+        
+        tk.Label(card.inner, text=f"Mapping Sale Items: {broken_name}", font=UI.FONT_MD, bg=UI.CARD, fg=UI.TEXT).pack(anchor="w")
+        tk.Label(card.inner, text="Select target valid product catalog record:", font=UI.FONT_SM, bg=UI.CARD, fg=UI.MUTED).pack(anchor="w", pady=(2, 10))
+        
+        try:
+            prods = list_products() or []
+        except Exception:
+            prods = []
+        options = []
+        prod_map = {}
+        for p in prods:
+            display = f"{row_get(p, 'name', '')} ({row_get(p, 'barcode', '')})"
+            options.append(display)
+            prod_map[display] = int(row_get(p, 'id', 0))
+            
+        cb_prod = ttk.Combobox(card.inner, values=options, width=45, state="readonly")
+        cb_prod.pack(anchor="w", pady=10)
+        if options:
+            cb_prod.set(options[0])
+            
+        def do_repair():
+            target_display = cb_prod.get()
+            target_id = prod_map.get(target_display)
+            if not target_id:
+                messagebox.showerror("Invalid", "Pick a target product.")
+                return
+            ok = repair_broken_product_links(item_ids_str, target_id)
+            if ok:
+                messagebox.showinfo("Repaired", "Broken links successfully updated to target product.", parent=win)
+                win.destroy()
+                self.refresh()
+            else:
+                messagebox.showerror("Failed", "Failed to repair product links.", parent=win)
+                
+        btn_row = tk.Frame(card.inner, bg=UI.CARD)
+        btn_row.pack(anchor="w", pady=(10, 0))
+        PrimaryButton(btn_row, "Confirm & Repair", do_repair).pack(side="left")
+        GhostButton(btn_row, "Cancel", win.destroy).pack(side="left", padx=(10, 0))
+
+    def open_recreate_repair_dialog(self):
+        sel = self.issue_tree.selection()
+        if not sel:
+            messagebox.showwarning("Select", "Select a broken sale item group to recreate.")
+            return
+            
+        item_ids_str = sel[0]
+        vals = self.issue_tree.item(item_ids_str, "values")
+        broken_name = vals[1]
+        broken_barcode = vals[2]
+        
+        win = tk.Toplevel(self)
+        win.title("Repair Link: Recreate Product")
+        win.geometry("540x360")
+        win.configure(bg=UI.CONTENT_BG)
+        win.transient(self.winfo_toplevel())
+        win.grab_set()
+        
+        card = Card(win, padx=14, pady=14)
+        card.pack(fill="both", expand=True, padx=10, pady=10)
+        
+        tk.Label(card.inner, text="Recreate Catalog Product Record", font=UI.FONT_MD, bg=UI.CARD, fg=UI.TEXT).pack(anchor="w")
+        tk.Label(card.inner, text=f"Will recreate item and link all occurrences of '{broken_name}'", font=UI.FONT_SM, bg=UI.CARD, fg=UI.MUTED).pack(anchor="w", pady=(2, 10))
+        
+        fields = tk.Frame(card.inner, bg=UI.CARD)
+        fields.pack(fill="x", pady=6)
+        
+        def field(parent, label, row, default_val=""):
+            tk.Label(parent, text=label, bg=UI.CARD, fg="#334155", width=14, anchor="w").grid(row=row, column=0, sticky="w", pady=4)
+            e = tk.Entry(parent, bd=1, relief="solid", width=32)
+            e.insert(0, default_val)
+            e.grid(row=row, column=1, sticky="w", pady=4)
+            return e
+            
+        name_e = field(fields, "Product name", 0, broken_name)
+        barcode_e = field(fields, "Barcode", 1, broken_barcode)
+        price_e = field(fields, "Sell price", 2)
+        cost_e = field(fields, "Cost price", 3)
+        supplier_e = field(fields, "Supplier", 4)
+        category_e = field(fields, "Category", 5)
+        brand_e = field(fields, "Brand", 6)
+        location_e = field(fields, "Location", 7)
+        
+        def do_recreate():
+            try:
+                name = name_e.get().strip()
+                barcode = barcode_e.get().strip()
+                price = float(price_e.get().strip())
+                cost = float(cost_e.get().strip() or "0")
+                supplier = supplier_e.get().strip()
+                category = category_e.get().strip()
+                brand = brand_e.get().strip()
+                location = location_e.get().strip()
+            except Exception:
+                messagebox.showerror("Invalid", "Check fields. Sell price must be a number.", parent=win)
+                return
+                
+            if not name or not barcode:
+                messagebox.showerror("Invalid", "Name and Barcode are required.", parent=win)
+                return
+                
+            ok = recreate_and_repair_product(
+                name, barcode, price, cost, supplier, category, brand, location, item_ids_str
+            )
+            if ok:
+                messagebox.showinfo("Success", "Catalog product recreated and historical transactions repaired.", parent=win)
+                win.destroy()
+                self.refresh()
+            else:
+                messagebox.showerror("Failed", "Failed to recreate and repair product link.", parent=win)
+                
+        btn_row = tk.Frame(card.inner, bg=UI.CARD)
+        btn_row.pack(anchor="w", pady=(10, 0))
+        PrimaryButton(btn_row, "Recreate & Confirm", do_recreate).pack(side="left")
+        GhostButton(btn_row, "Cancel", win.destroy).pack(side="left", padx=(10, 0))
+
+    def select_import_file(self):
+        from tkinter import filedialog
+        path = filedialog.askopenfilename(
+            title="Select CSV Import File",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")]
+        )
+        if not path:
+            return
+            
+        self.lbl_import_status.config(text=f"Loading: {Path(path).name}", fg=UI.PRIMARY)
+        self.preview_tree.delete(*self.preview_tree.get_children())
+        self.loaded_import_items = []
+        
+        try:
+            import csv
+            with open(path, "r", encoding="utf-8-sig") as f:
+                reader = csv.DictReader(f)
+                
+                headers = [h.strip().lower() for h in (reader.fieldnames or [])]
+                required = {"name", "sell_price"}
+                present = set(headers)
+                missing = required - present
+                if missing:
+                    messagebox.showerror("Invalid Format", f"CSV is missing required headers: {', '.join(missing)}")
+                    self.lbl_import_status.config(text="Error reading file.", fg="#ef4444")
+                    return
+                    
+                row_idx = 1
+                for row in reader:
+                    row_idx += 1
+                    raw_name = row.get("name", "").strip()
+                    raw_barcode = row.get("barcode", "").strip()
+                    raw_price = row.get("sell_price", "").strip()
+                    raw_cost = row.get("cost_price", "").strip() or "0"
+                    raw_stock = row.get("stock_qty", "").strip() or "0"
+                    raw_category = row.get("category", "").strip()
+                    raw_brand = row.get("brand", "").strip()
+                    raw_location = row.get("location", "").strip()
+                    raw_low = row.get("low_stock_level", "").strip() or "0"
+                    
+                    errors = []
+                    if not raw_name:
+                        errors.append("Missing name")
+                    try:
+                        price = float(raw_price)
+                        if price < 0: errors.append("Sell price negative")
+                    except Exception:
+                        errors.append("Invalid sell_price number")
+                        price = 0.0
+                    try:
+                        cost = float(raw_cost)
+                        if cost < 0: errors.append("Cost price negative")
+                    except Exception:
+                        errors.append("Invalid cost_price number")
+                        cost = 0.0
+                    try:
+                        stock = int(float(raw_stock))
+                    except Exception:
+                        errors.append("Invalid stock_qty integer")
+                        stock = 0
+                    try:
+                        low = int(float(raw_low))
+                    except Exception:
+                        errors.append("Invalid low_stock integer")
+                        low = 0
+                        
+                    err_msg = "; ".join(errors)
+                    iid = self.preview_tree.insert("", tk.END, values=(
+                        row_idx, raw_barcode, raw_name, raw_price, raw_cost, raw_stock, raw_category, raw_brand, raw_location, raw_low, err_msg or "Valid"
+                    ))
+                    
+                    if errors:
+                        self.preview_tree.tag_configure("error_row", background="#fecaca", foreground="#991b1b")
+                        self.preview_tree.item(iid, tags=("error_row",))
+                        
+                    self.loaded_import_items.append({
+                        "name": raw_name,
+                        "barcode": raw_barcode or None,
+                        "sell_price": price,
+                        "cost_price": cost,
+                        "stock_qty": stock,
+                        "category": raw_category,
+                        "brand": raw_brand,
+                        "location": raw_location,
+                        "low_stock_level": low,
+                        "has_errors": bool(errors)
+                    })
+                    
+            self.lbl_import_status.config(text=f"Loaded: {Path(path).name} ({len(self.loaded_import_items)} products)", fg=UI.SUCCESS)
+            self.preview_frame.pack(fill="x", pady=(10, 0))
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to parse CSV file:\n{e}")
+            self.lbl_import_status.config(text="Error reading file.", fg="#ef4444")
+
+    def commit_import(self):
+        if not self.loaded_import_items:
+            return
+            
+        has_errors = any(i["has_errors"] for i in self.loaded_import_items)
+        if has_errors:
+            if not messagebox.askyesno("Errors Found", "Some products have validation errors (highlighted in red). Do you want to skip those rows and import the valid ones?"):
+                return
+                
+        imported_count = 0
+        for item in self.loaded_import_items:
+            if item["has_errors"]:
+                continue
+            try:
+                add_product(
+                    name=item["name"],
+                    category=item["category"],
+                    brand=item["brand"],
+                    sell_price=item["sell_price"],
+                    stock_qty=item["stock_qty"],
+                    low_stock_level=item["low_stock_level"],
+                    barcode=item["barcode"],
+                    location=item["location"],
+                    cost_price=item["cost_price"],
+                    supplier=""
+                )
+                imported_count += 1
+            except Exception:
+                pass
+                
+        messagebox.showinfo("Import Complete", f"Successfully imported {imported_count} products.")
+        self.preview_frame.pack_forget()
+        self.lbl_import_status.config(text="No file loaded.", fg=UI.MUTED)
+        self.loaded_import_items = []
+        self.refresh()
 
 
 if __name__ == "__main__":

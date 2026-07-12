@@ -110,6 +110,8 @@ class ProductAddIn(BaseModel):
     stock_qty: int = 0
     low_stock_level: int = 0
     barcode: str | None = None
+    cost_price: float = 0.0
+    supplier: str | None = ""
 
 class ProductUpdateIn(BaseModel):
     product_id: int
@@ -118,10 +120,22 @@ class ProductUpdateIn(BaseModel):
     stock_qty: int
     low_stock_level: int
     location: str | None = ""
+    category: str | None = ""
+    brand: str | None = ""
 
 class StockAdjustIn(BaseModel):
     product_id: int
     delta_qty: int
+    reason: str = "Stock adjustment"
+    movement_type: str = "ADJUSTMENT"
+    reference_type: str = ""
+    reference_id: str = ""
+    employee_name: str = ""
+
+class ProductDetailsIn(BaseModel):
+    product_id: int
+    cost_price: float = 0.0
+    supplier: str = ""
 
 class ProductDeleteIn(BaseModel):
     product_id: int
@@ -135,6 +149,12 @@ class SaleCreateIn(BaseModel):
 
 class SaleDeleteIn(BaseModel):
     sale_id: int
+    restore_stock: bool = True
+
+class SaleVoidIn(BaseModel):
+    sale_id: int
+    reason: str
+    voided_by: str = ""
     restore_stock: bool = True
 
 class ReturnCreateIn(BaseModel):
@@ -408,6 +428,8 @@ def api_add_product(p: ProductAddIn):
         p.low_stock_level,
         p.barcode,
         p.location or "",
+        p.cost_price,
+        p.supplier or "",
     )
     snap = _product_snapshot(barcode=barcode)
     _cloud_enqueue("create", "product", (snap or {}).get("barcode") or barcode, snap or {
@@ -419,8 +441,16 @@ def api_add_product(p: ProductAddIn):
         "sell_price": p.sell_price,
         "stock_qty": p.stock_qty,
         "low_stock_level": p.low_stock_level,
+        "cost_price": p.cost_price,
+        "supplier": p.supplier or "",
     })
     return {"barcode": barcode}
+
+@app.get("/products/list")
+def api_list_products(query: str = ""):
+    rows = L.list_products(query)
+    return {"items": _as_list(rows)}
+
 
 @app.get("/products/list")
 def api_list_products(query: str = ""):
@@ -432,9 +462,21 @@ def api_find_by_barcode(barcode: str):
     row = L.find_product_by_barcode(barcode)
     return {"item": _as_dict_row(row)}
 
+@app.get("/products/reorder-suggestions")
+def api_reorder_suggestions(days: int = 30, target_days: int = 14, supplier: str = "", limit: int = 1000):
+    return {"items": _as_list(L.reorder_suggestions(days, target_days, supplier, limit))}
+
+@app.get("/products/{product_id}/sales")
+def api_product_sales(product_id: int, limit: int = 200, include_voided: int = 1):
+    return {"items": _as_list(L.list_product_sales(product_id, limit, bool(include_voided)))}
+
+@app.get("/products/{product_id}/price-history")
+def api_product_price_history(product_id: int, limit: int = 200):
+    return {"items": _as_list(L.list_product_price_history(product_id, limit))}
+
 @app.post("/products/update")
 def api_update_product(p: ProductUpdateIn):
-    L.update_product(p.product_id, p.name, p.sell_price, p.stock_qty, p.low_stock_level, p.location or "")
+    L.update_product(p.product_id, p.name, p.sell_price, p.stock_qty, p.low_stock_level, p.location or "", p.category or "", p.brand or "")
     snap = _product_snapshot(product_id=p.product_id)
     _cloud_enqueue("update", "product", (snap or {}).get("barcode") or p.product_id, snap or {
         "product_id": p.product_id,
@@ -443,17 +485,34 @@ def api_update_product(p: ProductUpdateIn):
         "stock_qty": p.stock_qty,
         "low_stock_level": p.low_stock_level,
         "location": p.location or "",
+        "category": p.category or "",
+        "brand": p.brand or "",
     })
     return {"ok": True}
 
 @app.post("/products/adjust_stock")
 def api_adjust_stock(p: StockAdjustIn):
-    ok = L.adjust_stock(p.product_id, p.delta_qty)
+    ok = L.adjust_stock(
+        p.product_id, p.delta_qty, p.reason, p.movement_type,
+        p.reference_type, p.reference_id, p.employee_name,
+    )
     if ok:
         snap = _product_snapshot(product_id=p.product_id) or {"product_id": p.product_id}
         snap["delta_qty"] = int(p.delta_qty or 0)
         _cloud_enqueue("adjust_stock", "product", snap.get("barcode") or p.product_id, snap)
     return {"ok": bool(ok)}
+
+@app.post("/products/update_details")
+def api_update_product_details(p: ProductDetailsIn):
+    ok = L.update_product_details(p.product_id, p.cost_price, p.supplier)
+    snap = _product_snapshot(product_id=p.product_id)
+    if ok and snap:
+        _cloud_enqueue("update", "product", snap.get("barcode") or p.product_id, snap)
+    return {"ok": bool(ok)}
+
+@app.get("/inventory/movements")
+def api_inventory_movements(product_id: int | None = None, limit: int = 500):
+    return {"items": _as_list(L.list_inventory_movements(product_id, limit))}
 
 @app.post("/products/delete")
 def api_delete_product(p: ProductDeleteIn):
@@ -488,14 +547,18 @@ def api_create_sale(s: SaleCreateIn):
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
+@app.get("/sales/search")
+def api_search_sales(query: str = "", include_voided: int = 1, limit: int = 200):
+    return {"items": _as_list(L.search_sales(query, bool(include_voided), limit))}
+
 @app.get("/sales/{sale_id}/receipt")
 def api_sale_receipt(sale_id: int):
     sale, items = L.get_sale_receipt_data(sale_id)
     return {"sale": sale, "items": items}
 
 @app.get("/sales/day")
-def api_sales_day(day: str, limit: int = 500):
-    rows = L.list_sales_for_day(day, limit)
+def api_sales_day(day: str, limit: int = 500, include_voided: int = 0):
+    rows = L.list_sales_for_day(day, limit, bool(include_voided))
     return {"items": _as_list(rows)}
 
 @app.get("/sales/{sale_id}/detail")
@@ -530,6 +593,22 @@ def api_delete_sale(d: SaleDeleteIn):
             "restore_stock": bool(d.restore_stock),
             "sale": sale_snapshot,
             "items": item_snapshot,
+        })
+    return {"ok": bool(ok)}
+
+@app.post("/sales/void")
+def api_void_sale(d: SaleVoidIn):
+    try:
+        ok = L.void_sale(d.sale_id, d.reason, d.voided_by, d.restore_stock)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    if ok:
+        sale, items = L.get_sale_detail(d.sale_id)
+        _cloud_enqueue("void", "sale", d.sale_id, {
+            "sale_id": int(d.sale_id), "reason": d.reason,
+            "voided_by": d.voided_by, "restore_stock": bool(d.restore_stock),
+            "sale": dict(sale) if sale else None,
+            "items": [dict(x) for x in (items or [])],
         })
     return {"ok": bool(ok)}
 
@@ -720,6 +799,9 @@ def api_open_shift(s: OpenShiftIn):
         "notes": s.notes or "",
         "employee_name": s.employee_name or "",
     })
+    import threading
+    import backend
+    threading.Thread(target=backend.send_shift_open_email, args=(sid,), daemon=True).start()
     return {"shift_id": int(sid)}
 
 
@@ -871,6 +953,14 @@ def api_low_stock(limit: int = 50):
     rows = L.analytics_low_stock(limit)
     return {"items": _as_list(rows)}
 
+@app.get("/analytics/data_health")
+def api_data_health(sample_limit: int = 8):
+    return {"health": L.data_health_summary(sample_limit)}
+
+@app.get("/analytics/discount-impact")
+def api_discount_impact(start_date: str, end_date: str, limit: int = 100):
+    return L.analytics_discount_impact(start_date, end_date, limit)
+
 @app.post("/analytics/send_daily_report_email")
 def api_send_daily_report_email(p: SendDailyReportEmailIn):
     day = p.day
@@ -948,6 +1038,68 @@ def api_send_daily_report_email(p: SendDailyReportEmailIn):
         return {"ok": False, "message": msg}
     except Exception as exc:
         return {"ok": False, "message": f"SMTP sending failed on host: {exc}"}
+
+
+class BulkEditIn(BaseModel):
+    product_ids: list[int]
+    category: str | None = None
+    location: str | None = None
+    low_stock: int | None = None
+    brand: str | None = None
+
+class RepairLinksIn(BaseModel):
+    sale_item_ids: list[int]
+    target_product_id: int
+
+class RecreateRepairIn(BaseModel):
+    name: str
+    barcode: str
+    sell_price: float
+    cost_price: float
+    supplier: str | None = ""
+    category: str | None = ""
+    brand: str | None = ""
+    location: str | None = ""
+    sale_item_ids: list[int]
+
+@app.get("/products/categories")
+def api_get_distinct_categories():
+    return {"items": L.get_distinct_categories()}
+
+@app.get("/health/stats")
+def api_get_data_health_stats():
+    return {"stats": L.get_data_health_stats()}
+
+@app.get("/health/issues")
+def api_list_health_issues(type: str):
+    return {"items": _as_list(L.list_health_issues(type))}
+
+@app.post("/products/bulk_edit")
+def api_bulk_edit_products(p: BulkEditIn):
+    ok = L.bulk_update_products(p.product_ids, p.category, p.location, p.low_stock, p.brand)
+    if ok:
+        for pid in p.product_ids:
+            snap = _product_snapshot(product_id=pid)
+            if snap:
+                _cloud_enqueue("update", "product", snap.get("barcode") or pid, snap)
+    return {"ok": ok}
+
+@app.post("/sales/repair_links")
+def api_repair_broken_links(p: RepairLinksIn):
+    ok = L.repair_broken_product_links(p.sale_item_ids, p.target_product_id)
+    return {"ok": ok}
+
+@app.post("/sales/recreate_repair")
+def api_recreate_repair(p: RecreateRepairIn):
+    ok = L.recreate_and_repair_product(
+        p.name, p.barcode, p.sell_price, p.cost_price, p.supplier or "",
+        p.category or "", p.brand or "", p.location or "", p.sale_item_ids
+    )
+    if ok:
+        snap = _product_snapshot(barcode=p.barcode)
+        if snap:
+            _cloud_enqueue("create", "product", p.barcode, snap)
+    return {"ok": ok}
 
 
 def main():

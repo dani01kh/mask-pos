@@ -8,7 +8,7 @@ const TABLES = {
     json: ["payload"],
   },
   products: {
-    columns: ["id", "barcode", "name", "category", "brand", "location", "sell_price", "stock_qty", "low_stock_level", "is_deleted", "created_at", "cloud_device_id", "cloud_local_id"],
+    columns: ["id", "barcode", "name", "category", "brand", "location", "sell_price", "stock_qty", "low_stock_level", "cost_price", "supplier", "is_deleted", "created_at", "cloud_device_id", "cloud_local_id"],
   },
   employees: {
     columns: ["id", "name", "pin", "is_active", "created_at", "cloud_device_id", "cloud_local_id"],
@@ -20,10 +20,10 @@ const TABLES = {
     columns: ["id", "created_at", "shift_id", "movement_type", "amount_usd", "amount_lbp", "lbp_per_usd", "amount_value", "reason", "employee_id", "employee_name", "notes", "cloud_event_id", "cloud_device_id", "cloud_local_id"],
   },
   sales: {
-    columns: ["id", "created_at", "total_amount", "payment_method", "customer_name", "shift_id", "receipt_date", "receipt_seq", "receipt_code", "subtotal", "discount", "discount_total", "tax", "tax_total", "shipping", "net_sales", "total_sales", "cash_paid", "store_credit_used", "is_exchange", "exchange_origin_sale_id", "notes", "cloud_event_id", "cloud_device_id", "cloud_local_id"],
+    columns: ["id", "created_at", "total_amount", "payment_method", "customer_name", "shift_id", "receipt_date", "receipt_seq", "receipt_code", "subtotal", "discount", "discount_total", "tax", "tax_total", "shipping", "net_sales", "total_sales", "cash_paid", "store_credit_used", "is_exchange", "exchange_origin_sale_id", "notes", "is_voided", "voided_at", "void_reason", "voided_by", "cloud_event_id", "cloud_device_id", "cloud_local_id"],
   },
   sale_items: {
-    columns: ["id", "sale_id", "product_id", "name", "price", "qty", "line_total", "gross_line_total", "discount_allocated", "cloud_event_id", "cloud_sale_event_id", "cloud_device_id", "cloud_local_id"],
+    columns: ["id", "sale_id", "product_id", "name", "price", "qty", "line_total", "gross_line_total", "discount_allocated", "original_unit_price", "line_discount", "product_barcode", "product_category", "cost_price", "supplier", "product_brand", "product_location", "cloud_event_id", "cloud_sale_event_id", "cloud_device_id", "cloud_local_id"],
   },
   returns: {
     columns: ["id", "original_sale_id", "created_at", "total_return_amount", "shift_id", "notes", "cash_refund", "credit_refund", "is_voided", "voided_at", "void_notes", "cloud_event_id", "cloud_device_id", "cloud_local_id", "cloud_original_sale_local_id"],
@@ -49,10 +49,14 @@ const JSON_HEADERS = {
 const now = () => new Date().toISOString();
 const text = (value, fallback = "") => value === null || value === undefined ? fallback : String(value);
 const num = (value, fallback = 0) => {
+  if (value === null || value === undefined || value === "") return fallback;
   const n = Number(value);
   return Number.isFinite(n) ? n : fallback;
 };
-const integer = (value, fallback = 0) => Math.trunc(num(value, fallback));
+const integer = (value, fallback = 0) => {
+  if (value === null || value === undefined || value === "") return fallback;
+  return Math.trunc(num(value, fallback));
+};
 const nullable = (value) => value === "" || value === undefined ? null : value;
 
 function response(data, status = 200) {
@@ -173,19 +177,21 @@ async function upsertProduct(db, raw, event = null) {
   await db.prepare(`
     INSERT INTO products (
       barcode, name, category, brand, location, sell_price, stock_qty, low_stock_level,
-      is_deleted, created_at, cloud_device_id, cloud_local_id
+      cost_price, supplier, is_deleted, created_at, cloud_device_id, cloud_local_id
     )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(barcode) DO UPDATE SET
       name = excluded.name, category = excluded.category, brand = excluded.brand,
       location = excluded.location,
       sell_price = excluded.sell_price, stock_qty = excluded.stock_qty,
-      low_stock_level = excluded.low_stock_level, is_deleted = excluded.is_deleted,
+      low_stock_level = excluded.low_stock_level, cost_price = excluded.cost_price,
+      supplier = excluded.supplier, is_deleted = excluded.is_deleted,
       cloud_device_id = COALESCE(NULLIF(excluded.cloud_device_id, ''), products.cloud_device_id),
       cloud_local_id = COALESCE(NULLIF(excluded.cloud_local_id, ''), products.cloud_local_id)
   `).bind(
     barcode, text(p.name, "Cloud item").trim() || "Cloud item", category, text(p.brand).trim(),
-    text(p.location).trim(), num(p.sell_price), stock, integer(p.low_stock_level), deleted, text(p.created_at, now()),
+    text(p.location).trim(), num(p.sell_price), stock, integer(p.low_stock_level),
+    Math.max(0, num(p.cost_price)), text(p.supplier).trim(), deleted, text(p.created_at, now()),
     text(p.cloud_device_id || (event && event.device_id)), text(p.cloud_local_id || p.id),
   ).run();
 }
@@ -352,9 +358,29 @@ async function applySale(db, event, payload) {
     await deleteSale(db, event, payload);
     return;
   }
+  if (event.event_type === "void") {
+    const localId = text(event.entity_id || payload.sale_id);
+    const sale = await db.prepare(
+      "SELECT id, is_voided FROM sales WHERE cloud_device_id = ? AND cloud_local_id = ? LIMIT 1"
+    ).bind(event.device_id, localId).first();
+    if (sale && !integer(sale.is_voided)) {
+      if (payload.restore_stock) {
+        const items = await db.prepare("SELECT product_id, qty FROM sale_items WHERE sale_id = ?").bind(sale.id).all();
+        for (const item of items.results || []) await adjustProductStock(db, item.product_id, integer(item.qty));
+      }
+      await db.prepare(
+        "UPDATE sales SET is_voided = 1, voided_at = ?, void_reason = ?, voided_by = ? WHERE id = ?"
+      ).bind(now(), text(payload.reason), text(payload.voided_by), sale.id).run();
+    }
+    return;
+  }
   if (event.event_type !== "create") return;
   const s = payload.sale && typeof payload.sale === "object" ? payload.sale : {};
-  const existing = await db.prepare("SELECT id FROM sales WHERE cloud_event_id = ? LIMIT 1").bind(event.event_id).first();
+  let existing = await db.prepare("SELECT id FROM sales WHERE cloud_event_id = ? LIMIT 1").bind(event.event_id).first();
+  if (!existing && event.device_id && text(event.entity_id || payload.sale_id)) {
+    existing = await db.prepare("SELECT id FROM sales WHERE cloud_device_id = ? AND cloud_local_id = ? LIMIT 1")
+      .bind(event.device_id, text(event.entity_id || payload.sale_id)).first();
+  }
   if (existing) return;
   let saleId = existing && existing.id;
   const shiftId = await mappedId(db, "cash_shifts", event.device_id, s.shift_id);
@@ -364,14 +390,16 @@ async function applySale(db, event, payload) {
         created_at, total_amount, payment_method, customer_name, shift_id, receipt_date, receipt_seq,
         receipt_code, subtotal, discount, discount_total, tax, tax_total, shipping, net_sales,
         total_sales, cash_paid, store_credit_used, is_exchange, exchange_origin_sale_id, notes,
+        is_voided, voided_at, void_reason, voided_by,
         cloud_event_id, cloud_device_id, cloud_local_id
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).bind(
       text(s.created_at, now()), num(s.total_amount ?? s.total_sales), text(s.payment_method || payload.payment_method, "CASH"),
       text(s.customer_name ?? payload.customer_name), shiftId, nullable(s.receipt_date), nullable(s.receipt_seq),
       text(s.receipt_code), num(s.subtotal), num(s.discount), num(s.discount_total), num(s.tax), num(s.tax_total),
       num(s.shipping), num(s.net_sales ?? s.total_sales), num(s.total_sales ?? s.total_amount), num(s.cash_paid),
       num(s.store_credit_used), integer(s.is_exchange), nullable(s.exchange_origin_sale_id), text(s.notes ?? payload.notes),
+      integer(s.is_voided), nullable(s.voided_at), text(s.void_reason), text(s.voided_by),
       event.event_id, event.device_id, text(event.entity_id || payload.sale_id),
     ).run();
     saleId = result.meta.last_row_id;
@@ -386,11 +414,17 @@ async function applySale(db, event, payload) {
     await db.prepare(`
       INSERT INTO sale_items (
         sale_id, product_id, name, price, qty, line_total, gross_line_total,
-        discount_allocated, cloud_event_id, cloud_sale_event_id, cloud_device_id, cloud_local_id
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        discount_allocated, original_unit_price, line_discount, product_barcode, product_category, cost_price, supplier,
+        product_brand, product_location,
+        cloud_event_id, cloud_sale_event_id, cloud_device_id, cloud_local_id
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).bind(
       saleId, productId, text(item.name), num(item.price), integer(item.qty), num(item.line_total),
       num(item.gross_line_total ?? item.line_total), num(item.discount_allocated),
+      num(item.original_unit_price ?? item.price), num(item.line_discount),
+      text(item.product_barcode ?? cartLine.barcode), text(item.product_category),
+      Math.max(0, num(item.cost_price)), text(item.supplier),
+      text(item.product_brand ?? cartLine.brand), text(item.product_location ?? cartLine.location),
       `${event.event_id}:${i + 1}`, event.event_id, event.device_id, text(item.id),
     ).run();
   }
@@ -427,7 +461,11 @@ async function applyReturn(db, event, payload) {
   }
   if (event.event_type !== "create") return;
   const saleId = await mappedId(db, "sales", event.device_id, payload.original_sale_id) || integer(payload.original_sale_id);
-  const existing = await db.prepare("SELECT id FROM returns WHERE cloud_event_id = ? LIMIT 1").bind(event.event_id).first();
+  let existing = await db.prepare("SELECT id FROM returns WHERE cloud_event_id = ? LIMIT 1").bind(event.event_id).first();
+  if (!existing && event.device_id && localId) {
+    existing = await db.prepare("SELECT id FROM returns WHERE cloud_device_id = ? AND cloud_local_id = ? LIMIT 1")
+      .bind(event.device_id, localId).first();
+  }
   if (existing) return;
   let returnId = existing && existing.id;
   if (!returnId) {

@@ -570,6 +570,106 @@ def set_daily_report_email_config(
     _save_config(cfg)
 
 
+def get_whatsapp_config() -> dict:
+    cfg = _load_config()
+    recipients = cfg.get("whatsapp_recipients") or []
+    if isinstance(recipients, str):
+        recipients = [r.strip() for r in re.split(r"[,\s;]+", recipients) if r.strip()]
+    return {
+        "enabled": bool(cfg.get("whatsapp_enabled", False)),
+        "phone_number_id": str(cfg.get("whatsapp_phone_number_id") or "").strip(),
+        "access_token": str(cfg.get("whatsapp_access_token") or "").strip(),
+        "recipients": recipients,
+    }
+
+
+def set_whatsapp_config(enabled=False, phone_number_id="", access_token="", recipients=None) -> None:
+    cfg = _load_config()
+    cfg["whatsapp_enabled"] = bool(enabled)
+    cfg["whatsapp_phone_number_id"] = str(phone_number_id or "").strip()
+    if access_token is not None:
+        cfg["whatsapp_access_token"] = str(access_token or "").strip()
+    
+    if isinstance(recipients, str):
+        processed = [r.strip() for r in re.split(r"[,\s;]+", recipients) if r.strip()]
+    elif isinstance(recipients, list):
+        processed = [str(r).strip() for r in recipients if str(r).strip()]
+    else:
+        processed = []
+    cfg["whatsapp_recipients"] = processed
+    _save_config(cfg)
+
+
+def send_whatsapp_message(message: str, recipients=None) -> tuple[bool, str]:
+    config = get_whatsapp_config()
+    if not config["enabled"]:
+        return False, "WhatsApp sending is disabled in Settings."
+        
+    phone_id = config["phone_number_id"]
+    token = config["access_token"]
+    if not phone_id or not token:
+        return False, "WhatsApp configuration is incomplete (missing Phone Number ID or Access Token)."
+        
+    if recipients is None:
+        recipients_list = config["recipients"]
+    elif isinstance(recipients, str):
+        recipients_list = [r.strip() for r in re.split(r"[,\s;]+", recipients) if r.strip()]
+    else:
+        recipients_list = [str(r).strip() for r in recipients if str(r).strip()]
+        
+    if not recipients_list:
+        return False, "No WhatsApp recipients configured."
+        
+    # Clean phone numbers (must be international format without +, e.g. 96170992077)
+    cleaned_recipients = []
+    for num in recipients_list:
+        clean = re.sub(r"\D", "", num)
+        if clean:
+            cleaned_recipients.append(clean)
+            
+    if not cleaned_recipients:
+        return False, "No valid phone numbers found in recipients."
+
+    url = f"https://graph.facebook.com/v17.0/{phone_id}/messages"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json"
+    }
+    
+    success_count = 0
+    errors = []
+    for phone in cleaned_recipients:
+        payload = {
+            "messaging_product": "whatsapp",
+            "to": phone,
+            "type": "text",
+            "text": {
+                "body": message
+            }
+        }
+        try:
+            import requests
+            response = requests.post(url, headers=headers, json=payload, timeout=15)
+            if response.status_code == 200:
+                success_count += 1
+            else:
+                try:
+                    err_json = response.json()
+                    err_msg = err_json.get("error", {}).get("message", response.text)
+                except Exception:
+                    err_msg = response.text
+                errors.append(f"Phone {phone}: Code {response.status_code} - {err_msg}")
+        except Exception as e:
+            errors.append(f"Phone {phone}: {e}")
+            
+    if success_count > 0:
+        if errors:
+            return True, f"Sent to {success_count} numbers. Failed on some: {'; '.join(errors)}"
+        return True, f"Successfully sent WhatsApp message to {success_count} recipient(s)."
+    else:
+        return False, f"Failed to send to any recipient. Errors: {'; '.join(errors)}"
+
+
 def mark_daily_report_email_sent(day_str: str, source: str = "") -> None:
     cfg = _load_config()
     cfg["daily_report_last_sent_date"] = str(day_str or "").strip()
@@ -609,11 +709,11 @@ def send_daily_report_email(subject: str, body: str, attachment_path, recipients
 
     if isinstance(attachment_path, (list, tuple, set)):
         attachment_paths = [Path(str(p)) for p in attachment_path if str(p or "").strip()]
+    elif attachment_path:
+        attachment_paths = [Path(str(attachment_path))]
     else:
-        attachment_paths = [Path(str(attachment_path or ""))]
+        attachment_paths = []
     attachment_paths = [p for p in attachment_paths if str(p).strip()]
-    if not attachment_paths:
-        return False, "No report file was provided."
     for path in attachment_paths:
         if not path.exists():
             return False, f"Report file not found: {path}"
@@ -660,6 +760,47 @@ def send_daily_report_email(subject: str, body: str, attachment_path, recipients
                 "Turn on 2-Step Verification for the sender account, create an App Password, then paste that 16-character code in Settings."
             )
         return False, f"Could not send report email: {exc}"
+
+
+def send_shift_open_email(shift_id):
+    try:
+        cfg = get_daily_report_email_config()
+        if not cfg.get("enabled", True):
+            return False, "Daily report email is disabled in Settings."
+
+        import pos_logic as L
+        summary = L.shift_summary(shift_id)
+        if not summary:
+            return False, "Shift not found."
+
+        shift = summary.get("shift", {}) or {}
+        emp_name = shift.get("employee_name") or "System"
+        opened_at = shift.get("opened_at") or ""
+        notes = shift.get("notes") or "No opening check difference."
+
+        opening_cash = summary.get("opening_cash", 0.0)
+        opening_usd = summary.get("opening_usd", 0.0)
+        opening_lbp = summary.get("opening_lbp", 0.0)
+        rate = summary.get("lbp_per_usd", 89500.0)
+
+        subject = f"Mask POS Register Opened - {emp_name}"
+        body = (
+            f"Register Opened Notification\n"
+            f"----------------------------\n"
+            f"Employee: {emp_name}\n"
+            f"Opened At: {opened_at}\n\n"
+            f"Opening Count Details:\n"
+            f"  - Counted USD: ${opening_usd:,.2f}\n"
+            f"  - Counted LBP: {opening_lbp:,.0f} LBP\n"
+            f"  - Exchange Rate: {rate:,.0f} LBP/USD\n"
+            f"  - Total Opening Value: ${opening_cash:,.2f}\n\n"
+            f"Opening Status / Notes:\n"
+            f"  {notes}\n"
+        )
+        ok, msg = send_daily_report_email(subject, body, [])
+        return ok, msg
+    except Exception as e:
+        return False, f"Failed to send register open email: {e}"
 
 
 def trigger_daily_report_email_on_host(day: str, source: str = "manual", force: bool = False) -> tuple[bool, str]:
@@ -2008,11 +2149,11 @@ def _cash_movement_snapshot_local(movement_id=None) -> dict:
 
 # ---------------- API compatible functions (match pos_logic) ----------------
 
-def add_product(name, category="", brand="", sell_price=0.0, stock_qty=0, low_stock_level=0, barcode=None, location=""):
+def add_product(name, category="", brand="", sell_price=0.0, stock_qty=0, low_stock_level=0, barcode=None, location="", cost_price=0.0, supplier=""):
     requested_barcode = _clean_user_barcode(barcode)
 
     if _use_local_db():
-        out = _local().add_product(name, category, brand, sell_price, stock_qty, low_stock_level, requested_barcode or None, location)
+        out = _local().add_product(name, category, brand, sell_price, stock_qty, low_stock_level, requested_barcode or None, location, cost_price, supplier)
         snapshot = {}
         try:
             if isinstance(out, int):
@@ -2084,7 +2225,8 @@ def add_product(name, category="", brand="", sell_price=0.0, stock_qty=0, low_st
 
     payload = {
         "name": name, "category": category, "brand": brand,
-        "location": location, "sell_price": sell_price, "stock_qty": stock_qty, "low_stock_level": low_stock_level
+        "location": location, "sell_price": sell_price, "stock_qty": stock_qty, "low_stock_level": low_stock_level,
+        "cost_price": float(cost_price or 0.0), "supplier": str(supplier or "")
     }
     if requested_barcode:
         payload["barcode"] = requested_barcode
@@ -2129,9 +2271,9 @@ def find_product_by_barcode(barcode):
     return _remote_get(f"/products/by_barcode/{barcode}").get("item")
 
 
-def update_product(product_id, name, sell_price, stock_qty, low_stock_level, location=""):
+def update_product(product_id, name, sell_price, stock_qty, low_stock_level, location="", category="", brand=""):
     if _use_local_db():
-        ok = _local().update_product(product_id, name, sell_price, stock_qty, low_stock_level, location)
+        ok = _local().update_product(product_id, name, sell_price, stock_qty, low_stock_level, location, category, brand)
         if ok:
             snapshot = _product_snapshot_local(product_id)
             payload = snapshot or {
@@ -2141,18 +2283,44 @@ def update_product(product_id, name, sell_price, stock_qty, low_stock_level, loc
                 "stock_qty": stock_qty,
                 "low_stock_level": low_stock_level,
                 "location": location,
+                "category": category,
+                "brand": brand,
             }
             _cloud_enqueue("update", "product", payload.get("barcode") or product_id, payload)
         return ok
     return bool(_remote_post("/products/update", {
         "product_id": product_id, "name": name, "sell_price": sell_price,
-        "stock_qty": stock_qty, "low_stock_level": low_stock_level, "location": location
+        "stock_qty": stock_qty, "low_stock_level": low_stock_level, "location": location,
+        "category": category, "brand": brand
     }).get("ok", True))
 
 
-def adjust_stock(product_id, delta_qty):
+def update_product_details(product_id, cost_price=0.0, supplier=""):
     if _use_local_db():
-        ok = _local().adjust_stock(product_id, delta_qty)
+        ok = _local().update_product_details(product_id, cost_price, supplier)
+        if ok:
+            snapshot = _product_snapshot_local(product_id)
+            _cloud_enqueue("update", "product", (snapshot or {}).get("barcode") or product_id, snapshot or {})
+        return ok
+    return bool(_remote_post("/products/update_details", {
+        "product_id": int(product_id),
+        "cost_price": float(cost_price or 0.0),
+        "supplier": str(supplier or ""),
+    }).get("ok", True))
+
+
+def list_inventory_movements(product_id=None, limit=500):
+    if _use_local_db():
+        return _local().list_inventory_movements(product_id, limit)
+    params = {"limit": int(limit or 500)}
+    if product_id not in (None, ""):
+        params["product_id"] = int(product_id)
+    return _remote_get("/inventory/movements", params).get("items", [])
+
+
+def adjust_stock(product_id, delta_qty, reason="Stock adjustment", movement_type="ADJUSTMENT", reference_type="", reference_id="", employee_name=""):
+    if _use_local_db():
+        ok = _local().adjust_stock(product_id, delta_qty, reason, movement_type, reference_type, reference_id, employee_name)
         if ok:
             snapshot = _product_snapshot_local(product_id)
             payload = snapshot or {"product_id": int(product_id)}
@@ -2162,7 +2330,12 @@ def adjust_stock(product_id, delta_qty):
             })
             _cloud_enqueue("adjust_stock", "product", payload.get("barcode") or product_id, payload)
         return ok
-    return bool(_remote_post("/products/adjust_stock", {"product_id": product_id, "delta_qty": delta_qty}).get("ok", True))
+    return bool(_remote_post("/products/adjust_stock", {
+        "product_id": product_id, "delta_qty": delta_qty,
+        "reason": reason, "movement_type": movement_type,
+        "reference_type": reference_type, "reference_id": str(reference_id or ""),
+        "employee_name": employee_name,
+    }).get("ok", True))
 
 
 def delete_product(product_id):
@@ -2214,11 +2387,13 @@ def get_sale_receipt_data(sale_id):
     return j.get("sale"), j.get("items", [])
 
 
-def list_sales_for_day(day_str, limit=500):
+def list_sales_for_day(day_str, limit=500, include_voided=False):
     if _use_local_db():
-        return _local().list_sales_for_day(day_str, limit)
+        return _local().list_sales_for_day(day_str, limit, include_voided)
 
-    items = _remote_get("/sales/day", {"day": day_str, "limit": limit}).get("items", []) or []
+    items = _remote_get("/sales/day", {
+        "day": day_str, "limit": limit, "include_voided": int(bool(include_voided))
+    }).get("items", []) or []
 
     # ---- Normalize cash_paid for remote rows (host mode) ----
     # Some servers/older DBs return gross totals without a cash_paid field.
@@ -2274,6 +2449,52 @@ def list_sales_for_day(day_str, limit=500):
         r["cash_paid"] = round(float(paid), 2)
 
     return items
+
+
+def search_sales(query="", include_voided=True, limit=200):
+    if _use_local_db():
+        return _local().search_sales(query, include_voided, limit)
+    return _remote_get("/sales/search", {
+        "query": str(query or ""), "include_voided": int(bool(include_voided)),
+        "limit": int(limit or 200),
+    }).get("items", [])
+
+
+def list_product_sales(product_id, limit=200, include_voided=True):
+    if _use_local_db():
+        return _local().list_product_sales(product_id, limit, include_voided)
+    return _remote_get(f"/products/{int(product_id)}/sales", {
+        "limit": int(limit or 200), "include_voided": int(bool(include_voided)),
+    }).get("items", [])
+
+
+def list_product_price_history(product_id, limit=200):
+    if _use_local_db():
+        return _local().list_product_price_history(product_id, limit)
+    return _remote_get(f"/products/{int(product_id)}/price-history", {
+        "limit": int(limit or 200),
+    }).get("items", [])
+
+
+def reorder_suggestions(days=30, target_days=14, supplier="", limit=1000):
+    if _use_local_db():
+        return _local().reorder_suggestions(days, target_days, supplier, limit)
+    return _remote_get("/products/reorder-suggestions", {
+        "days": int(days or 30),
+        "target_days": int(target_days or 14),
+        "supplier": str(supplier or ""),
+        "limit": int(limit or 1000),
+    }).get("items", [])
+
+
+def analytics_discount_impact(start_date, end_date, limit=100):
+    if _use_local_db():
+        return _local().analytics_discount_impact(start_date, end_date, limit)
+    return _remote_get("/analytics/discount-impact", {
+        "start_date": str(start_date or ""),
+        "end_date": str(end_date or ""),
+        "limit": int(limit or 100),
+    })
 
 
 
@@ -2462,6 +2683,27 @@ def delete_sale(sale_id, restore_stock=True):
             })
         return ok
     j = _remote_post("/sales/delete", {"sale_id": sale_id, "restore_stock": restore_stock})
+    return bool(j.get("ok", True))
+
+
+def void_sale(sale_id, reason="", voided_by="", restore_stock=True):
+    if _use_local_db():
+        ok = _local().void_sale(sale_id, reason, voided_by, restore_stock)
+        if ok:
+            sale, items = _local().get_sale_detail(sale_id)
+            _cloud_enqueue("void", "sale", sale_id, {
+                "sale_id": int(sale_id),
+                "reason": str(reason or ""),
+                "voided_by": str(voided_by or ""),
+                "restore_stock": bool(restore_stock),
+                "sale": dict(sale) if sale else None,
+                "items": [dict(x) for x in (items or [])],
+            })
+        return ok
+    j = _remote_post("/sales/void", {
+        "sale_id": int(sale_id), "reason": str(reason or ""),
+        "voided_by": str(voided_by or ""), "restore_stock": bool(restore_stock),
+    })
     return bool(j.get("ok", True))
 
 
@@ -2659,6 +2901,8 @@ def open_shift(opening_cash=0.0, notes="", employee_name="", opening_usd=None, o
         }
         payload["shift_id"] = int(shift_id or 0)
         _cloud_enqueue("open", "shift", shift_id, payload)
+        import threading
+        threading.Thread(target=send_shift_open_email, args=(shift_id,), daemon=True).start()
         return shift_id
     j = _remote_post("/shifts/open", {
         "opening_cash": opening_cash,
@@ -2879,6 +3123,12 @@ def analytics_low_stock(limit=50):
     if _use_local_db():
         return _local().analytics_low_stock(limit)
     return _remote_get("/analytics/low_stock", {"limit": limit}).get("items", [])
+
+
+def data_health_summary(sample_limit=8):
+    if _use_local_db():
+        return _local().data_health_summary(sample_limit)
+    return _remote_get("/analytics/data_health", {"sample_limit": int(sample_limit or 8)}).get("health", {})
 
 
 
@@ -3690,3 +3940,74 @@ def stop_backend() -> None:
         _STOP_HEARTBEAT = True
         _DISCOVERY_STOP = True
     _BACKUP_STOP_EVENT.set()
+
+
+# ---------------- DATA HEALTH & REPAIR WRAPPERS ----------------
+
+def get_distinct_categories():
+    if _use_local_db():
+        return _local().get_distinct_categories()
+    return _remote_get("/products/categories").get("items", [])
+
+
+def get_data_health_stats():
+    if _use_local_db():
+        return _local().get_data_health_stats()
+    return _remote_get("/health/stats").get("stats", {})
+
+
+def list_health_issues(issue_type):
+    if _use_local_db():
+        return _local().list_health_issues(issue_type)
+    return _remote_get("/health/issues", {"type": issue_type}).get("items", [])
+
+
+def bulk_update_products(product_ids, category=None, location=None, low_stock=None, brand=None):
+    if _use_local_db():
+        ok = _local().bulk_update_products(product_ids, category, location, low_stock, brand)
+        if ok:
+            for pid in product_ids:
+                snapshot = _product_snapshot_local(pid)
+                if snapshot:
+                    _cloud_enqueue("update", "product", snapshot.get("barcode") or pid, snapshot)
+        return ok
+    
+    return bool(_remote_post("/products/bulk_edit", {
+        "product_ids": [int(x) for x in product_ids],
+        "category": category,
+        "location": location,
+        "low_stock": low_stock,
+        "brand": brand
+    }).get("ok", True))
+
+
+def repair_broken_product_links(sale_item_ids, target_product_id):
+    if _use_local_db():
+        return _local().repair_broken_product_links(sale_item_ids, target_product_id)
+    
+    return bool(_remote_post("/sales/repair_links", {
+        "sale_item_ids": [int(x) for x in sale_item_ids],
+        "target_product_id": int(target_product_id)
+    }).get("ok", True))
+
+
+def recreate_and_repair_product(name, barcode, sell_price, cost_price, supplier, category, brand, location, sale_item_ids):
+    if _use_local_db():
+        ok = _local().recreate_and_repair_product(name, barcode, sell_price, cost_price, supplier, category, brand, location, sale_item_ids)
+        if ok:
+            snapshot = _product_snapshot_local(None, barcode)
+            if snapshot:
+                _cloud_enqueue("create", "product", barcode, snapshot)
+        return ok
+    
+    return bool(_remote_post("/sales/recreate_repair", {
+        "name": name,
+        "barcode": barcode,
+        "sell_price": float(sell_price),
+        "cost_price": float(cost_price),
+        "supplier": supplier,
+        "category": category,
+        "brand": brand,
+        "location": location,
+        "sale_item_ids": [int(x) for x in sale_item_ids]
+    }).get("ok", True))

@@ -168,8 +168,9 @@ def create_temp_receipt_pdf(shop_name: str, sale, items) -> Path:
         name = str(_row_get(it, "name", "")) or ""
         qty = int(_row_get(it, "qty", 0) or 0)
         price = float(_row_get(it, "price", 0.0) or 0.0)
+        original_price = float(_row_get(it, "original_unit_price", price) or price)
         lt = float(_row_get(it, "line_total", price * qty) or 0.0)
-        pre_subtotal += float(price * qty)
+        pre_subtotal += float(max(price, original_price) * qty)
         subtotal += lt
 
         # Wrap product name to fit thermal width
@@ -179,7 +180,13 @@ def create_temp_receipt_pdf(shop_name: str, sale, items) -> Path:
         if len(name_lines) > 1:
             draw_left(name_lines[1], bold=False, size=10)
 
-        draw_left(f"{qty} x ${price:.2f} = ${lt:.2f}", size=10)
+        effective_unit = (lt / qty) if qty else price
+        if original_price - effective_unit > 0.005:
+            pct = ((original_price - effective_unit) / original_price * 100.0) if original_price > 0 else 0.0
+            draw_left(f"{qty} x ${effective_unit:.2f} = ${lt:.2f}", size=10)
+            draw_left(f"  DISCOUNT: was ${original_price:.2f}  (-${original_price-effective_unit:.2f}, {pct:.0f}%)", size=9)
+        else:
+            draw_left(f"{qty} x ${price:.2f} = ${lt:.2f}", size=10)
 
         # If we're getting close to the bottom, start a new (thermal-sized) page
         if y < 40 * mm:

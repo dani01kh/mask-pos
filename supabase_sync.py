@@ -150,6 +150,16 @@ def init_sync(db_path: Path) -> None:
                 state_value TEXT NOT NULL
             )
         """)
+        # Add cloud tracking columns to core tables if they don't exist
+        for table in ("sales", "returns", "cash_shifts", "cash_movements"):
+            try:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN cloud_device_id TEXT")
+            except sqlite3.OperationalError:
+                pass
+            try:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN cloud_local_id TEXT")
+            except sqlite3.OperationalError:
+                pass
         conn.commit()
     finally:
         conn.close()
@@ -742,18 +752,22 @@ def seed_cloud_products_if_empty(base_dir: Path) -> int:
     return count
 
 
-def fetch_cloud_products(limit: int = 1000) -> list[dict]:
-    import requests
-    resp = requests.get(
-        _cloud_table_url(PRODUCT_TABLE),
-        headers=_supabase_headers(),
-        params={"select": "*", "order": "barcode.asc", "limit": int(limit or 1000)},
-        timeout=12,
-    )
-    if not (200 <= resp.status_code < 300):
-        raise RuntimeError(f"products fetch {resp.status_code}: {resp.text[:300]}")
-    rows = resp.json() or []
-    return rows if isinstance(rows, list) else []
+def fetch_cloud_products(limit: int | None = None) -> list[dict]:
+    """Fetch the complete cloud catalog, optionally capped to ``limit`` rows.
+
+    The hosted REST API returns at most 1,000 rows per request.  A single
+    request silently truncated larger catalogs, leaving valid products absent
+    from newly prepared cloud-mode caches.  Reuse the paginated table reader
+    so every product is downloaded in stable barcode order.
+    """
+    rows = _fetch_cloud_table(PRODUCT_TABLE, order="barcode.asc", page_size=1000, max_pages=100)
+    if limit is None:
+        return rows
+    try:
+        cap = max(0, int(limit))
+    except (TypeError, ValueError):
+        cap = 0
+    return rows[:cap]
 
 
 def _fetch_cloud_table(table: str, order: str = "id.asc", page_size: int = 1000, max_pages: int = 20) -> list[dict]:
@@ -879,12 +893,20 @@ def _normalize_sales_rows(rows: list[dict]) -> tuple[list[dict], set[str]]:
     for row in clean:
         local_id = str(row.get("cloud_local_id") or "").strip()
         if local_id:
+            try:
+                amt = float(row.get("total_amount") if row.get("total_amount") is not None else row.get("total_sales") or 0.0)
+                amt_str = f"{amt:.2f}"
+            except Exception:
+                amt_str = "0.00"
+            created_at_normalized = str(row.get("created_at") or "").strip()
+            if len(created_at_normalized) >= 19:
+                created_at_normalized = created_at_normalized[:19]
             key = (
                 "local",
                 local_id,
-                str(row.get("created_at") or ""),
-                str(row.get("receipt_code") or ""),
-                str(row.get("total_amount") if row.get("total_amount") is not None else row.get("total_sales") or ""),
+                created_at_normalized,
+                str(row.get("receipt_code") or "").strip(),
+                amt_str,
             )
         else:
             key = ("cloud", str(row.get("id") or ""))
@@ -1208,6 +1230,8 @@ def _apply_product_event(db_path: Path, event: dict, payload: dict) -> str:
         sell_price = float(payload.get("sell_price") if payload.get("sell_price") is not None else (row["sell_price"] if row else 0))
         stock_qty = max(0, int(payload.get("stock_qty") if payload.get("stock_qty") is not None else (row["stock_qty"] if row else 0)))
         low_stock_level = int(payload.get("low_stock_level") if payload.get("low_stock_level") is not None else (row["low_stock_level"] if row else 0))
+        cost_price = max(0.0, float(payload.get("cost_price") if payload.get("cost_price") is not None else (row["cost_price"] if row and "cost_price" in row.keys() else 0)))
+        supplier = str(payload.get("supplier") if payload.get("supplier") is not None else (row["supplier"] if row and "supplier" in row.keys() else "")).strip()
         is_deleted = int(payload.get("is_deleted") if payload.get("is_deleted") is not None else 0)
         if category.lower() == "quick" and stock_qty <= 0:
             is_deleted = 1
@@ -1216,17 +1240,17 @@ def _apply_product_event(db_path: Path, event: dict, payload: dict) -> str:
             cur.execute("""
                 UPDATE products
                 SET name = ?, category = ?, brand = ?, sell_price = ?, stock_qty = ?,
-                    low_stock_level = ?, is_deleted = ?, location = ?
+                    low_stock_level = ?, is_deleted = ?, location = ?, cost_price = ?, supplier = ?
                 WHERE id = ?
-            """, (name, category, brand, sell_price, stock_qty, low_stock_level, is_deleted, location, int(row["id"])))
+            """, (name, category, brand, sell_price, stock_qty, low_stock_level, is_deleted, location, cost_price, supplier, int(row["id"])))
             conn.commit()
             return "updated product"
 
         cur.execute("""
             INSERT INTO products
-                (barcode, name, category, brand, location, sell_price, stock_qty, low_stock_level, is_deleted, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (barcode, name, category, brand, location, sell_price, stock_qty, low_stock_level, is_deleted, _now_iso()))
+                (barcode, name, category, brand, location, sell_price, stock_qty, low_stock_level, cost_price, supplier, is_deleted, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (barcode, name, category, brand, location, sell_price, stock_qty, low_stock_level, cost_price, supplier, is_deleted, _now_iso()))
         conn.commit()
         return "created product"
     finally:

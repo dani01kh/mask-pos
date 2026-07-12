@@ -10,6 +10,7 @@ from pathlib import Path
 import sqlite3
 import random
 import re
+import math
 from datetime import datetime, date, timedelta
 
 def _base_dir() -> Path:
@@ -272,6 +273,12 @@ def init_db():
 
         # Sales compatibility
         _ensure_column(cur, "products", "location", "TEXT")
+        _ensure_column(cur, "products", "cost_price", "REAL NOT NULL DEFAULT 0")
+        _ensure_column(cur, "products", "supplier", "TEXT NOT NULL DEFAULT ''")
+        # Optional manager-only purchasing data. These stay optional so the
+        # cashier product-creation flow remains unchanged.
+        _ensure_column(cur, "products", "cost_price", "REAL NOT NULL DEFAULT 0")
+        _ensure_column(cur, "products", "supplier", "TEXT NOT NULL DEFAULT ''")
 
         _ensure_column(cur, "sales", "total_amount", "REAL NOT NULL DEFAULT 0")
         _ensure_column(cur, "sales", "shift_id", "INTEGER")
@@ -361,6 +368,26 @@ def init_db():
         _ensure_column(cur, "cash_movements", "employee_id", "INTEGER")
         _ensure_column(cur, "cash_movements", "employee_name", "TEXT")
         _ensure_column(cur, "cash_movements", "notes", "TEXT")
+
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS inventory_movements (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT NOT NULL,
+            product_id INTEGER,
+            barcode TEXT NOT NULL DEFAULT '',
+            product_name TEXT NOT NULL DEFAULT '',
+            movement_type TEXT NOT NULL DEFAULT 'ADJUSTMENT',
+            qty_change INTEGER NOT NULL DEFAULT 0,
+            qty_before INTEGER NOT NULL DEFAULT 0,
+            qty_after INTEGER NOT NULL DEFAULT 0,
+            reason TEXT NOT NULL DEFAULT '',
+            reference_type TEXT NOT NULL DEFAULT '',
+            reference_id TEXT NOT NULL DEFAULT '',
+            employee_name TEXT NOT NULL DEFAULT '',
+            notes TEXT NOT NULL DEFAULT '',
+            FOREIGN KEY(product_id) REFERENCES products(id)
+        )
+        """)
 
         # Some older DBs had "total" instead of "total_amount"
         sales_cols = set(_table_cols(cur, "sales"))
@@ -480,9 +507,94 @@ def _unique_barcode(cur):
     return datetime.now().strftime("%y%m%d%H%M%S")
 
 
-# ---------------- PRODUCTS ----------------
+# ---------------- PRODUCTS / INVENTORY AUDIT ----------------
 
-def add_product(name, category="", brand="", sell_price=0.0, stock_qty=0, low_stock_level=0, barcode=None, location=""):
+def _record_inventory_movement_cur(
+    cur,
+    product_id,
+    qty_change,
+    qty_before,
+    qty_after,
+    movement_type="ADJUSTMENT",
+    reason="",
+    reference_type="",
+    reference_id="",
+    employee_name="",
+    notes="",
+):
+    """Write one stock-ledger row inside the caller's transaction."""
+    product = None
+    if product_id is not None:
+        product = cur.execute(
+            "SELECT barcode, name FROM products WHERE id = ? LIMIT 1",
+            (int(product_id),),
+        ).fetchone()
+    cur.execute(
+        """
+        INSERT INTO inventory_movements (
+            created_at, product_id, barcode, product_name, movement_type,
+            qty_change, qty_before, qty_after, reason, reference_type,
+            reference_id, employee_name, notes
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            _now_iso(),
+            int(product_id) if product_id is not None else None,
+            str(product["barcode"] if product else ""),
+            str(product["name"] if product else ""),
+            str(movement_type or "ADJUSTMENT").strip().upper(),
+            int(qty_change or 0),
+            int(qty_before or 0),
+            int(qty_after or 0),
+            str(reason or "").strip(),
+            str(reference_type or "").strip(),
+            str(reference_id or "").strip(),
+            str(employee_name or "").strip(),
+            str(notes or "").strip(),
+        ),
+    )
+
+
+def list_inventory_movements(product_id=None, limit=500):
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        params = []
+        where = ""
+        if product_id not in (None, ""):
+            where = "WHERE product_id = ?"
+            params.append(int(product_id))
+        params.append(max(1, min(int(limit or 500), 5000)))
+        return cur.execute(
+            f"""
+            SELECT * FROM inventory_movements
+            {where}
+            ORDER BY datetime(created_at) DESC, id DESC
+            LIMIT ?
+            """,
+            params,
+        ).fetchall()
+    finally:
+        conn.close()
+
+
+def update_product_details(product_id, cost_price=0.0, supplier=""):
+    """Update optional purchasing fields without changing cashier-facing data."""
+    conn = get_conn()
+    try:
+        conn.execute(
+            "UPDATE products SET cost_price = ?, supplier = ? WHERE id = ?",
+            (max(0.0, float(cost_price or 0.0)), str(supplier or "").strip(), int(product_id)),
+        )
+        conn.commit()
+        return True
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+def add_product(name, category="", brand="", sell_price=0.0, stock_qty=0, low_stock_level=0, barcode=None, location="", cost_price=0.0, supplier=""):
     conn = None
     try:
         conn = get_conn()
@@ -497,8 +609,11 @@ def add_product(name, category="", brand="", sell_price=0.0, stock_qty=0, low_st
                 raise ValueError(f"Barcode already exists: {requested_barcode}")
         barcode = requested_barcode or _unique_barcode(cur)
         cur.execute("""
-            INSERT INTO products (barcode, name, category, brand, location, sell_price, stock_qty, low_stock_level, is_deleted, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
+            INSERT INTO products (
+                barcode, name, category, brand, location, sell_price, stock_qty,
+                low_stock_level, is_deleted, created_at, cost_price, supplier
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
         """, (
             str(barcode),
             str(name).strip(),
@@ -508,8 +623,17 @@ def add_product(name, category="", brand="", sell_price=0.0, stock_qty=0, low_st
             float(sell_price or 0),
             int(stock_qty or 0),
             int(low_stock_level or 0),
-            _now_iso()
+            _now_iso(),
+            max(0.0, float(cost_price or 0.0)),
+            str(supplier or "").strip(),
         ))
+
+        product_id = int(cur.lastrowid)
+        if int(stock_qty or 0) != 0:
+            _record_inventory_movement_cur(
+                cur, product_id, int(stock_qty or 0), 0, int(stock_qty or 0),
+                movement_type="OPENING_STOCK", reason="Product created",
+            )
 
         conn.commit()
         return barcode
@@ -572,6 +696,10 @@ def update_product(product_id, name, sell_price, stock_qty, low_stock_level, loc
     try:
         conn = get_conn()
         cur = conn.cursor()
+        before_row = cur.execute(
+            "SELECT stock_qty FROM products WHERE id = ? LIMIT 1", (int(product_id),)
+        ).fetchone()
+        before_stock = int(before_row["stock_qty"] or 0) if before_row else int(stock_qty or 0)
         cur.execute("""
             UPDATE products
             SET name = ?, sell_price = ?, stock_qty = ?, low_stock_level = ?, location = ?
@@ -584,6 +712,12 @@ def update_product(product_id, name, sell_price, stock_qty, low_stock_level, loc
             str(location or "").strip(),
             int(product_id)
         ))
+        after_stock = int(stock_qty or 0)
+        if before_row and after_stock != before_stock:
+            _record_inventory_movement_cur(
+                cur, product_id, after_stock - before_stock, before_stock, after_stock,
+                movement_type="MANUAL_COUNT", reason="Product stock edited",
+            )
         conn.commit()
         return True
     except Exception:
@@ -595,18 +729,41 @@ def update_product(product_id, name, sell_price, stock_qty, low_stock_level, loc
             conn.close()
 
 
-def adjust_stock(product_id, delta_qty):
+def adjust_stock(
+    product_id,
+    delta_qty,
+    reason="Stock adjustment",
+    movement_type="ADJUSTMENT",
+    reference_type="",
+    reference_id="",
+    employee_name="",
+):
     conn = None
     try:
         conn = get_conn()
         cur = conn.cursor()
+        row = cur.execute(
+            "SELECT stock_qty FROM products WHERE id = ? LIMIT 1", (int(product_id),)
+        ).fetchone()
+        if not row:
+            return False
+        before_stock = int(row["stock_qty"] or 0)
         cur.execute("""
             UPDATE products
             SET stock_qty = stock_qty + ?
             WHERE id = ?
         """, (int(delta_qty), int(product_id)))
+        changed = cur.rowcount > 0
+        if changed:
+            after_stock = before_stock + int(delta_qty)
+            _record_inventory_movement_cur(
+                cur, product_id, int(delta_qty), before_stock, after_stock,
+                movement_type=movement_type, reason=reason,
+                reference_type=reference_type, reference_id=reference_id,
+                employee_name=employee_name,
+            )
         conn.commit()
-        return cur.rowcount > 0
+        return changed
     except Exception:
         if conn:
             conn.rollback()
@@ -882,7 +1039,9 @@ def init_db():
             total_amount REAL NOT NULL DEFAULT 0,
             payment_method TEXT NOT NULL DEFAULT 'CASH',
             customer_name TEXT NOT NULL DEFAULT '',
-            shift_id INTEGER
+            shift_id INTEGER,
+            cloud_device_id TEXT,
+            cloud_local_id TEXT
         )
         """)
 
@@ -918,6 +1077,8 @@ def init_db():
             closing_cash REAL,
             notes TEXT,
             employee_id INTEGER,
+            cloud_device_id TEXT,
+            cloud_local_id TEXT,
             FOREIGN KEY(employee_id) REFERENCES employees(id)
         )
         """)
@@ -930,6 +1091,8 @@ def init_db():
             total_return_amount REAL NOT NULL DEFAULT 0,
             shift_id INTEGER,
             notes TEXT,
+            cloud_device_id TEXT,
+            cloud_local_id TEXT,
             FOREIGN KEY(original_sale_id) REFERENCES sales(id)
         )
         """)
@@ -1004,6 +1167,8 @@ def init_db():
 
         # Sales compatibility
         _ensure_column(cur, "products", "location", "TEXT")
+        _ensure_column(cur, "products", "cost_price", "REAL NOT NULL DEFAULT 0")
+        _ensure_column(cur, "products", "supplier", "TEXT NOT NULL DEFAULT ''")
 
         _ensure_column(cur, "sales", "total_amount", "REAL NOT NULL DEFAULT 0")
         _ensure_column(cur, "sales", "shift_id", "INTEGER")
@@ -1023,6 +1188,11 @@ def init_db():
         _ensure_column(cur, "sales", "net_sales", "REAL NOT NULL DEFAULT 0")
         _ensure_column(cur, "sales", "total_sales", "REAL NOT NULL DEFAULT 0")
         _ensure_column(cur, "sales", "notes", "TEXT DEFAULT ''")
+        # Keep voided transactions instead of deleting their audit trail.
+        _ensure_column(cur, "sales", "is_voided", "INTEGER NOT NULL DEFAULT 0")
+        _ensure_column(cur, "sales", "voided_at", "TEXT")
+        _ensure_column(cur, "sales", "void_reason", "TEXT NOT NULL DEFAULT ''")
+        _ensure_column(cur, "sales", "voided_by", "TEXT NOT NULL DEFAULT ''")
 
         # Tender/accounting columns keep exchanges and returns out of cash totals.
         _ensure_column(cur, "sales", "cash_paid", "REAL NOT NULL DEFAULT 0")
@@ -1033,6 +1203,30 @@ def init_db():
         # Net line amounts are required for accurate discounted returns.
         _ensure_column(cur, "sale_items", "gross_line_total", "REAL NOT NULL DEFAULT 0")
         _ensure_column(cur, "sale_items", "discount_allocated", "REAL NOT NULL DEFAULT 0")
+        # Product identity and cost snapshots keep old analytics stable even if
+        # the live product is later renamed, deleted, or moved.
+        _ensure_column(cur, "sale_items", "product_barcode", "TEXT NOT NULL DEFAULT ''")
+        _ensure_column(cur, "sale_items", "product_category", "TEXT NOT NULL DEFAULT ''")
+        _ensure_column(cur, "sale_items", "cost_price", "REAL NOT NULL DEFAULT 0")
+        _ensure_column(cur, "sale_items", "supplier", "TEXT NOT NULL DEFAULT ''")
+        _ensure_column(cur, "sale_items", "product_brand", "TEXT NOT NULL DEFAULT ''")
+        _ensure_column(cur, "sale_items", "product_location", "TEXT NOT NULL DEFAULT ''")
+        _ensure_column(cur, "sale_items", "original_unit_price", "REAL NOT NULL DEFAULT 0")
+        _ensure_column(cur, "sale_items", "line_discount", "REAL NOT NULL DEFAULT 0")
+
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS product_price_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            product_id INTEGER NOT NULL,
+            changed_at TEXT NOT NULL,
+            old_price REAL NOT NULL DEFAULT 0,
+            new_price REAL NOT NULL DEFAULT 0,
+            changed_by TEXT NOT NULL DEFAULT '',
+            reason TEXT NOT NULL DEFAULT '',
+            FOREIGN KEY(product_id) REFERENCES products(id)
+        )
+        """)
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_product_price_history_product ON product_price_history(product_id, changed_at DESC)")
 
         _ensure_column(cur, "returns", "cash_refund", "REAL NOT NULL DEFAULT 0")
         _ensure_column(cur, "returns", "credit_refund", "REAL NOT NULL DEFAULT 0")
@@ -1057,6 +1251,13 @@ def init_db():
         _ensure_column(cur, "cash_shifts", "lbp_per_usd", "REAL NOT NULL DEFAULT 89500")
         _backfill_cash_shift_daily_numbers(cur)
 
+        # Cloud synchronization tracking compatibility
+        _ensure_column(cur, "sales", "cloud_device_id", "TEXT")
+        _ensure_column(cur, "sales", "cloud_local_id", "TEXT")
+        _ensure_column(cur, "returns", "cloud_device_id", "TEXT")
+        _ensure_column(cur, "returns", "cloud_local_id", "TEXT")
+        _ensure_column(cur, "cash_shifts", "cloud_device_id", "TEXT")
+        _ensure_column(cur, "cash_shifts", "cloud_local_id", "TEXT")
         cur.execute("""
         CREATE TABLE IF NOT EXISTS cash_movements (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1071,6 +1272,8 @@ def init_db():
             employee_id INTEGER,
             employee_name TEXT,
             notes TEXT,
+            cloud_device_id TEXT,
+            cloud_local_id TEXT,
             FOREIGN KEY(shift_id) REFERENCES cash_shifts(id),
             FOREIGN KEY(employee_id) REFERENCES employees(id)
         )
@@ -1087,6 +1290,28 @@ def init_db():
         _ensure_column(cur, "cash_movements", "employee_id", "INTEGER")
         _ensure_column(cur, "cash_movements", "employee_name", "TEXT")
         _ensure_column(cur, "cash_movements", "notes", "TEXT")
+        _ensure_column(cur, "cash_movements", "cloud_device_id", "TEXT")
+        _ensure_column(cur, "cash_movements", "cloud_local_id", "TEXT")
+
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS inventory_movements (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT NOT NULL,
+            product_id INTEGER,
+            barcode TEXT NOT NULL DEFAULT '',
+            product_name TEXT NOT NULL DEFAULT '',
+            movement_type TEXT NOT NULL DEFAULT 'ADJUSTMENT',
+            qty_change INTEGER NOT NULL DEFAULT 0,
+            qty_before INTEGER NOT NULL DEFAULT 0,
+            qty_after INTEGER NOT NULL DEFAULT 0,
+            reason TEXT NOT NULL DEFAULT '',
+            reference_type TEXT NOT NULL DEFAULT '',
+            reference_id TEXT NOT NULL DEFAULT '',
+            employee_name TEXT NOT NULL DEFAULT '',
+            notes TEXT NOT NULL DEFAULT '',
+            FOREIGN KEY(product_id) REFERENCES products(id)
+        )
+        """)
 
         # Quick items are temporary catalog rows created for receipt compatibility.
         # Older builds deducted their stock from zero and left them visible forever.
@@ -1154,6 +1379,8 @@ def init_db():
         cur.execute("CREATE INDEX IF NOT EXISTS idx_bon_redemptions_bon ON bon_redemptions(bon_id)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_cash_movements_shift ON cash_movements(shift_id)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_cash_movements_created ON cash_movements(created_at)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_inventory_movements_product ON inventory_movements(product_id, created_at)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_inventory_movements_created ON inventory_movements(created_at)")
 
         try:
             _repair_unassigned_sales(cur)
@@ -1192,7 +1419,7 @@ def _unique_barcode(cur):
 
 # ---------------- PRODUCTS ----------------
 
-def add_product(name, category="", brand="", sell_price=0.0, stock_qty=0, low_stock_level=0, barcode=None, location=""):
+def add_product(name, category="", brand="", sell_price=0.0, stock_qty=0, low_stock_level=0, barcode=None, location="", cost_price=0.0, supplier=""):
     conn = None
     try:
         conn = get_conn()
@@ -1207,8 +1434,11 @@ def add_product(name, category="", brand="", sell_price=0.0, stock_qty=0, low_st
                 raise ValueError(f"Barcode already exists: {requested_barcode}")
         barcode = requested_barcode or _unique_barcode(cur)
         cur.execute("""
-            INSERT INTO products (barcode, name, category, brand, location, sell_price, stock_qty, low_stock_level, is_deleted, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
+            INSERT INTO products (
+                barcode, name, category, brand, location, sell_price, stock_qty,
+                low_stock_level, is_deleted, created_at, cost_price, supplier
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
         """, (
             str(barcode),
             str(name).strip(),
@@ -1218,8 +1448,17 @@ def add_product(name, category="", brand="", sell_price=0.0, stock_qty=0, low_st
             float(sell_price or 0),
             int(stock_qty or 0),
             int(low_stock_level or 0),
-            _now_iso()
+            _now_iso(),
+            max(0.0, float(cost_price or 0.0)),
+            str(supplier or "").strip(),
         ))
+
+        product_id = int(cur.lastrowid)
+        if int(stock_qty or 0) != 0:
+            _record_inventory_movement_cur(
+                cur, product_id, int(stock_qty or 0), 0, int(stock_qty or 0),
+                movement_type="OPENING_STOCK", reason="Product created",
+            )
 
         conn.commit()
         return barcode
@@ -1277,14 +1516,19 @@ def find_product_by_barcode(barcode):
             conn.close()
 
 
-def update_product(product_id, name, sell_price, stock_qty, low_stock_level, location=""):
+def update_product(product_id, name, sell_price, stock_qty, low_stock_level, location="", category="", brand=""):
     conn = None
     try:
         conn = get_conn()
         cur = conn.cursor()
+        before_row = cur.execute(
+            "SELECT stock_qty, sell_price FROM products WHERE id = ? LIMIT 1", (int(product_id),)
+        ).fetchone()
+        before_stock = int(before_row["stock_qty"] or 0) if before_row else int(stock_qty or 0)
+        before_price = float(before_row["sell_price"] or 0.0) if before_row else float(sell_price or 0.0)
         cur.execute("""
             UPDATE products
-            SET name = ?, sell_price = ?, stock_qty = ?, low_stock_level = ?, location = ?
+            SET name = ?, sell_price = ?, stock_qty = ?, low_stock_level = ?, location = ?, category = ?, brand = ?
             WHERE id = ?
         """, (
             str(name).strip(),
@@ -1292,8 +1536,24 @@ def update_product(product_id, name, sell_price, stock_qty, low_stock_level, loc
             int(stock_qty or 0),
             int(low_stock_level or 0),
             str(location or "").strip(),
+            str(category or "").strip(),
+            str(brand or "").strip(),
             int(product_id)
         ))
+        after_stock = int(stock_qty or 0)
+        if before_row and after_stock != before_stock:
+            _record_inventory_movement_cur(
+                cur, product_id, after_stock - before_stock, before_stock, after_stock,
+                movement_type="MANUAL_COUNT", reason="Product stock edited",
+            )
+        after_price = float(sell_price or 0.0)
+        if before_row and abs(after_price - before_price) > 0.0001:
+            cur.execute(
+                """INSERT INTO product_price_history
+                   (product_id, changed_at, old_price, new_price, reason)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (int(product_id), _now_iso(), before_price, after_price, "Product price edited"),
+            )
         conn.commit()
         return True
     except Exception:
@@ -1305,18 +1565,41 @@ def update_product(product_id, name, sell_price, stock_qty, low_stock_level, loc
             conn.close()
 
 
-def adjust_stock(product_id, delta_qty):
+def adjust_stock(
+    product_id,
+    delta_qty,
+    reason="Stock adjustment",
+    movement_type="ADJUSTMENT",
+    reference_type="",
+    reference_id="",
+    employee_name="",
+):
     conn = None
     try:
         conn = get_conn()
         cur = conn.cursor()
+        row = cur.execute(
+            "SELECT stock_qty FROM products WHERE id = ? LIMIT 1", (int(product_id),)
+        ).fetchone()
+        if not row:
+            return False
+        before_stock = int(row["stock_qty"] or 0)
         cur.execute("""
             UPDATE products
             SET stock_qty = stock_qty + ?
             WHERE id = ?
         """, (int(delta_qty), int(product_id)))
+        changed = cur.rowcount > 0
+        if changed:
+            after_stock = before_stock + int(delta_qty)
+            _record_inventory_movement_cur(
+                cur, product_id, int(delta_qty), before_stock, after_stock,
+                movement_type=movement_type, reason=reason,
+                reference_type=reference_type, reference_id=reference_id,
+                employee_name=employee_name,
+            )
         conn.commit()
-        return cur.rowcount > 0
+        return changed
     except Exception:
         if conn:
             conn.rollback()
@@ -2060,6 +2343,7 @@ def sales_totals_for_shift(shift_id):
             SELECT *
             FROM sales
             WHERE shift_id = ?
+              AND COALESCE(is_voided, 0) = 0
             """,
             (int(shift_id),),
         )
@@ -2226,7 +2510,7 @@ def _sql_bounds_inclusive(start_date, end_date):
 
 
 
-def list_sales_for_day(day_str, limit=500):
+def list_sales_for_day(day_str, limit=500, include_voided=False):
     """List sales for a specific day (newest first).
 
     IMPORTANT ACCOUNTING RULE:
@@ -2250,8 +2534,9 @@ def list_sales_for_day(day_str, limit=500):
         has_is_exchange = _sales_has_column(cur, "is_exchange")
         has_receipt_code = _sales_has_column(cur, "receipt_code")
 
+        void_filter = "" if include_voided else "AND COALESCE(s.is_voided, 0) = 0"
         cur.execute(
-            """
+            f"""
             SELECT
                 s.*,
                 cs.shift_code AS shift_code,
@@ -2266,6 +2551,7 @@ def list_sales_for_day(day_str, limit=500):
             ) rsum ON rsum.original_sale_id = s.id
             WHERE datetime(s.created_at) >= datetime(?)
               AND datetime(s.created_at) < datetime(?)
+              {void_filter}
             ORDER BY datetime(s.created_at) DESC
             LIMIT ?
             """,
@@ -2300,6 +2586,202 @@ def list_sales_for_day(day_str, limit=500):
                 conn.close()
         except Exception:
             pass
+
+
+def search_sales(query="", include_voided=True, limit=200):
+    """Search receipts and item text across every date without loading all sales."""
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        q = str(query or "").strip()
+        params = []
+        search_filter = ""
+        if q:
+            like = f"%{q}%"
+            search_filter = """
+              AND (
+                    CAST(s.id AS TEXT) LIKE ?
+                 OR COALESCE(s.receipt_code, '') LIKE ?
+                 OR COALESCE(s.receipt_date, '') LIKE ?
+                 OR COALESCE(s.payment_method, '') LIKE ?
+                 OR COALESCE(e.name, '') LIKE ?
+                 OR EXISTS (
+                     SELECT 1 FROM sale_items sx
+                     WHERE sx.sale_id = s.id
+                       AND (
+                            COALESCE(sx.name, '') LIKE ?
+                         OR COALESCE(sx.product_barcode, '') LIKE ?
+                       )
+                 )
+              )
+            """
+            params.extend([like] * 7)
+        void_filter = "" if include_voided else "AND COALESCE(s.is_voided, 0) = 0"
+        params.append(max(1, min(int(limit or 200), 1000)))
+        rows = cur.execute(
+            f"""
+            SELECT s.*, cs.shift_code, COALESCE(e.name, '') AS employee_name,
+                   GROUP_CONCAT(DISTINCT si.name) AS item_names,
+                   COALESCE(rsum.returns_amount, 0) AS returns_amount
+            FROM sales s
+            LEFT JOIN cash_shifts cs ON cs.id = s.shift_id
+            LEFT JOIN employees e ON e.id = cs.employee_id
+            LEFT JOIN sale_items si ON si.sale_id = s.id
+            LEFT JOIN (
+                SELECT original_sale_id, SUM(total_return_amount) AS returns_amount
+                FROM returns WHERE COALESCE(is_voided, 0) = 0
+                GROUP BY original_sale_id
+            ) rsum ON rsum.original_sale_id = s.id
+            WHERE 1 = 1
+              {void_filter}
+              {search_filter}
+            GROUP BY s.id
+            ORDER BY datetime(s.created_at) DESC, s.id DESC
+            LIMIT ?
+            """,
+            params,
+        ).fetchall()
+        return rows
+    finally:
+        conn.close()
+
+
+def list_product_sales(product_id, limit=200, include_voided=True):
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        void_filter = "" if include_voided else "AND COALESCE(s.is_voided, 0) = 0"
+        return cur.execute(
+            f"""
+            SELECT s.id AS sale_id, s.created_at, s.receipt_code, s.payment_method,
+                   s.total_sales, s.total_amount, s.is_voided,
+                   si.name, si.price, si.qty, si.line_total,
+                   COALESCE((
+                       SELECT SUM(ri.qty)
+                       FROM return_items ri JOIN returns r ON r.id = ri.return_id
+                       WHERE ri.sale_item_id = si.id AND COALESCE(r.is_voided,0)=0
+                   ), 0) AS returned_qty
+            FROM sale_items si
+            JOIN sales s ON s.id = si.sale_id
+            WHERE si.product_id = ?
+              {void_filter}
+            ORDER BY datetime(s.created_at) DESC, s.id DESC
+            LIMIT ?
+            """,
+            (int(product_id), max(1, min(int(limit or 200), 1000))),
+        ).fetchall()
+    finally:
+        conn.close()
+
+
+def list_product_price_history(product_id, limit=200):
+    conn = get_conn()
+    try:
+        return conn.execute(
+            """SELECT id, product_id, changed_at, old_price, new_price,
+                      changed_by, reason,
+                      ROUND(new_price - old_price, 2) AS price_change
+               FROM product_price_history
+               WHERE product_id = ?
+               ORDER BY datetime(changed_at) DESC, id DESC
+               LIMIT ?""",
+            (int(product_id), max(1, min(int(limit or 200), 1000))),
+        ).fetchall()
+    finally:
+        conn.close()
+
+
+def reorder_suggestions(days=30, target_days=14, supplier="", limit=1000):
+    """Optional purchasing suggestions based on recent net unit sales."""
+    days = max(1, min(int(days or 30), 365))
+    target_days = max(1, min(int(target_days or 14), 180))
+    cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
+    conn = get_conn()
+    try:
+        params = [cutoff]
+        supplier_filter = ""
+        if str(supplier or "").strip():
+            supplier_filter = "AND COALESCE(p.supplier, '') = ?"
+            params.append(str(supplier).strip())
+        params.append(max(1, min(int(limit or 1000), 5000)))
+        rows = conn.execute(
+            f"""
+            SELECT p.id AS product_id, p.barcode, p.name, p.supplier,
+                   p.stock_qty, p.cost_price, p.sell_price,
+                   COALESCE(SUM(CASE WHEN s.id IS NOT NULL AND COALESCE(s.is_voided,0)=0 THEN si.qty ELSE 0 END),0)
+                   - COALESCE((
+                       SELECT SUM(ri.qty)
+                       FROM return_items ri
+                       JOIN returns r ON r.id=ri.return_id
+                       WHERE ri.product_id=p.id AND datetime(r.created_at)>=datetime(?)
+                         AND COALESCE(r.is_voided,0)=0
+                   ),0) AS net_qty_sold
+            FROM products p
+            LEFT JOIN sale_items si ON si.product_id=p.id
+            LEFT JOIN sales s ON s.id=si.sale_id AND datetime(s.created_at)>=datetime(?)
+            WHERE COALESCE(p.is_deleted,0)=0 {supplier_filter}
+            GROUP BY p.id
+            ORDER BY COALESCE(p.supplier,''), p.name
+            LIMIT ?
+            """,
+            [cutoff] + params,
+        ).fetchall()
+        out = []
+        for raw in rows:
+            rec = dict(raw)
+            sold = max(0, int(rec.get("net_qty_sold") or 0))
+            stock = int(rec.get("stock_qty") or 0)
+            daily = sold / float(days)
+            target = int(math.ceil(daily * target_days))
+            suggested = max(0, target - stock)
+            rec.update({
+                "days": days,
+                "target_days": target_days,
+                "avg_daily_units": round(daily, 2),
+                "target_stock": target,
+                "suggested_qty": suggested,
+                "days_cover": (round(stock / daily, 1) if daily > 0 else None),
+                "estimated_cost": round(suggested * float(rec.get("cost_price") or 0.0), 2),
+            })
+            if suggested > 0:
+                out.append(rec)
+        return out
+    finally:
+        conn.close()
+
+
+def analytics_discount_impact(start_date, end_date, limit=100):
+    s0, e1 = _sql_bounds_inclusive(start_date, end_date)
+    conn = get_conn()
+    try:
+        rows = conn.execute(
+            """
+            SELECT si.product_id, si.name,
+                   SUM(si.qty) AS qty,
+                   SUM(COALESCE(NULLIF(si.gross_line_total,0), si.price*si.qty)) AS before_discount,
+                   SUM(si.line_total) AS after_discount,
+                   SUM(MAX(0, COALESCE(NULLIF(si.gross_line_total,0), si.price*si.qty)-si.line_total)) AS discount_amount,
+                   SUM(si.cost_price*si.qty) AS estimated_cost
+            FROM sale_items si JOIN sales s ON s.id=si.sale_id
+            WHERE datetime(s.created_at)>=datetime(?) AND datetime(s.created_at)<datetime(?)
+              AND COALESCE(s.is_voided,0)=0
+            GROUP BY si.product_id, si.name
+            HAVING discount_amount > 0.005
+            ORDER BY discount_amount DESC
+            LIMIT ?
+            """,
+            (s0, e1, max(1, min(int(limit or 100), 1000))),
+        ).fetchall()
+        items = [dict(r) for r in rows]
+        return {
+            "items": items,
+            "before_discount": round(sum(float(r.get("before_discount") or 0) for r in items), 2),
+            "after_discount": round(sum(float(r.get("after_discount") or 0) for r in items), 2),
+            "discount_amount": round(sum(float(r.get("discount_amount") or 0) for r in items), 2),
+            "estimated_profit_after": round(sum(float(r.get("after_discount") or 0)-float(r.get("estimated_cost") or 0) for r in items), 2),
+        }
+    finally:
+        conn.close()
 
 def get_sale_detail(sale_id):
     conn = None
@@ -2614,10 +3096,18 @@ def create_return(original_sale_id: int, returned_lines, notes: str = ""):
 
             # restock inventory (if product_id exists)
             if pid is not None and qty:
+                stock_row = cur.execute("SELECT stock_qty FROM products WHERE id = ?", (int(pid),)).fetchone()
+                before = int(stock_row["stock_qty"] or 0) if stock_row else 0
                 cur.execute(
                     "UPDATE products SET stock_qty = stock_qty + ? WHERE id = ?",
                     (qty, int(pid))
                 )
+                if stock_row:
+                    _record_inventory_movement_cur(
+                        cur, pid, qty, before, before + qty,
+                        movement_type="RETURN", reason="Customer return",
+                        reference_type="return", reference_id=str(return_id),
+                    )
 
         conn.commit()
         return return_id, float(total_return)
@@ -3208,10 +3698,18 @@ def void_return(return_id: int, notes: str = ""):
             qty = int(it["qty"] or 0)
             if pid is None or qty <= 0:
                 continue
+            stock_row = cur.execute("SELECT stock_qty FROM products WHERE id = ?", (int(pid),)).fetchone()
+            before = int(stock_row["stock_qty"] or 0) if stock_row else 0
             cur.execute(
                 "UPDATE products SET stock_qty = stock_qty - ? WHERE id = ?",
                 (qty, int(pid)),
             )
+            if stock_row:
+                _record_inventory_movement_cur(
+                    cur, pid, -qty, before, before - qty,
+                    movement_type="RETURN_VOID", reason=str(notes or "Return voided"),
+                    reference_type="return", reference_id=str(return_id),
+                )
 
         cur.execute(
             """
@@ -3310,10 +3808,18 @@ def reset_returns_for_sale(original_sale_id: int, notes: str = ""):
             qty = int(it["qty"] or 0)
             if pid is None or qty <= 0:
                 continue
+            stock_row = cur.execute("SELECT stock_qty FROM products WHERE id = ?", (int(pid),)).fetchone()
+            before = int(stock_row["stock_qty"] or 0) if stock_row else 0
             cur.execute(
                 "UPDATE products SET stock_qty = stock_qty - ? WHERE id = ?",
                 (qty, int(pid)),
             )
+            if stock_row:
+                _record_inventory_movement_cur(
+                    cur, pid, -qty, before, before - qty,
+                    movement_type="RETURN_RESET", reason=str(notes or "Returns reset"),
+                    reference_type="sale", reference_id=str(original_sale_id),
+                )
 
         cur.execute(
             f"""
@@ -3356,7 +3862,80 @@ def reset_returns_for_sale(original_sale_id: int, notes: str = ""):
         if conn:
             conn.close()
 
-# ---------------- DELETE SALE (RESTORE STOCK) ----------------
+# ---------------- AUDITABLE SALE VOID / LEGACY DELETE ----------------
+
+def void_sale(sale_id, reason="", voided_by="", restore_stock=True):
+    """Void a sale in place and restore its outstanding stock exactly once."""
+    reason = str(reason or "").strip()
+    if not reason:
+        raise ValueError("A reason is required to void a sale.")
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        sale = cur.execute(
+            "SELECT * FROM sales WHERE id = ? LIMIT 1", (int(sale_id),)
+        ).fetchone()
+        if not sale:
+            return False
+        if int(sale["is_voided"] or 0):
+            raise ValueError("This sale is already voided.")
+
+        active_returns = cur.execute(
+            "SELECT COUNT(*) FROM returns WHERE original_sale_id = ? AND COALESCE(is_voided,0)=0",
+            (int(sale_id),),
+        ).fetchone()[0]
+        if int(active_returns or 0) > 0:
+            raise ValueError("Void/reset the active return for this sale before voiding the sale.")
+
+        redemptions = cur.execute(
+            "SELECT COUNT(*) FROM bon_redemptions WHERE sale_id = ?", (int(sale_id),)
+        ).fetchone()[0]
+        if int(redemptions or 0) > 0:
+            raise ValueError("This sale used a store-credit bon and cannot be voided automatically.")
+
+        items = cur.execute(
+            "SELECT id, product_id, qty FROM sale_items WHERE sale_id = ?",
+            (int(sale_id),),
+        ).fetchall()
+        if restore_stock:
+            for item in items:
+                if item["product_id"] is None:
+                    continue
+                product = cur.execute(
+                    "SELECT stock_qty FROM products WHERE id = ? LIMIT 1",
+                    (int(item["product_id"]),),
+                ).fetchone()
+                if not product:
+                    continue
+                before = int(product["stock_qty"] or 0)
+                qty = max(0, int(item["qty"] or 0))
+                after = before + qty
+                cur.execute(
+                    "UPDATE products SET stock_qty = ? WHERE id = ?",
+                    (after, int(item["product_id"])),
+                )
+                _record_inventory_movement_cur(
+                    cur, item["product_id"], qty, before, after,
+                    movement_type="SALE_VOID", reason=reason,
+                    reference_type="sale", reference_id=str(sale_id),
+                    employee_name=voided_by,
+                )
+
+        cur.execute(
+            """
+            UPDATE sales
+            SET is_voided = 1, voided_at = ?, void_reason = ?, voided_by = ?
+            WHERE id = ?
+            """,
+            (_now_iso(), reason, str(voided_by or "").strip(), int(sale_id)),
+        )
+        conn.commit()
+        return True
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 def delete_sale(sale_id, restore_stock=True):
     """Delete a sale and its items. If restore_stock=True, adds sold qty back to products.stock_qty."""
@@ -3491,7 +4070,8 @@ def create_sale(cart_lines, payment_method="CASH", customer_name="", order_disco
             qty_ = int(l.get("qty") or 0)
             return price_ * qty_
 
-        subtotal = sum(_line_total(l) for l in cart_lines)
+        line_subtotals = [float(_line_total(l) or 0.0) for l in cart_lines]
+        subtotal = sum(line_subtotals)
 
         # order_discount_total is a real discount (seasonal/manual). Exchange credit is tracked separately via notes.
         try:
@@ -3600,7 +4180,20 @@ def create_sale(cart_lines, payment_method="CASH", customer_name="", order_disco
         #   sale_items.discount_allocated = allocated share of order-level discount
         #   sale_items.line_total = NET line total (after allocation)
         # This makes returns accurate even after partial returns.
-        gross_lines = [float(_line_total(l) or 0.0) for l in cart_lines]
+        # A manually reduced unit price is a real line discount. Preserve the
+        # catalog/original price so receipts and analytics can show $15 -> $10.
+        gross_lines = []
+        line_discounts = []
+        for i, line in enumerate(cart_lines):
+            qty_ = max(0, int(line.get("qty") or 0))
+            final_before_order = float(line_subtotals[i] if i < len(line_subtotals) else _line_total(line))
+            try:
+                original_unit = float(line.get("original_price", line.get("price", 0)) or 0.0)
+            except Exception:
+                original_unit = float(line.get("price") or 0.0)
+            gross = max(final_before_order, original_unit * qty_)
+            gross_lines.append(gross)
+            line_discounts.append(max(0.0, gross - final_before_order))
         allocated_discounts = [0.0 for _ in gross_lines]
         if subtotal > 0 and discount_total > 0 and len(gross_lines) > 0:
             # First pass proportional allocation
@@ -3609,15 +4202,15 @@ def create_sale(cart_lines, payment_method="CASH", customer_name="", order_disco
                 if i == len(gross_lines) - 1:
                     alloc = round(float(discount_total) - running, 2)
                 else:
-                    alloc = round(float(discount_total) * (float(gl) / float(subtotal)), 2)
+                    alloc = round(float(discount_total) * (float(line_subtotals[i]) / float(subtotal)), 2)
                     running += alloc
                 if alloc < 0:
                     alloc = 0.0
-                if alloc > gl:
-                    alloc = gl
+                if alloc > line_subtotals[i]:
+                    alloc = line_subtotals[i]
                 allocated_discounts[i] = alloc
 
-        net_line_totals = [round(max(0.0, gross_lines[i] - allocated_discounts[i]), 2) for i in range(len(gross_lines))]
+        net_line_totals = [round(max(0.0, line_subtotals[i] - allocated_discounts[i]), 2) for i in range(len(gross_lines))]
 
 
 
@@ -3724,12 +4317,22 @@ def create_sale(cart_lines, payment_method="CASH", customer_name="", order_disco
             price = float(l.get("price") or 0)
             qty = int(l.get("qty") or 0)
             gross_lt = float(gross_lines[i] if i < len(gross_lines) else _line_total(l))
-            alloc_disc = float(allocated_discounts[i] if i < len(allocated_discounts) else 0.0)
+            order_alloc_disc = float(allocated_discounts[i] if i < len(allocated_discounts) else 0.0)
+            line_disc = float(line_discounts[i] if i < len(line_discounts) else 0.0)
+            alloc_disc = line_disc + order_alloc_disc
             lt = float(net_line_totals[i] if i < len(net_line_totals) else gross_lt)
 
             pid = l.get("product_id")
             if pid is None:
                 raise ValueError("Missing product_id in cart line")
+
+            product_snapshot = cur.execute(
+                """
+                SELECT barcode, category, cost_price, supplier, brand, location
+                FROM products WHERE id = ? LIMIT 1
+                """,
+                (int(pid),),
+            ).fetchone()
 
             values_map_si = {
                 "sale_id": sale_id,
@@ -3740,12 +4343,20 @@ def create_sale(cart_lines, payment_method="CASH", customer_name="", order_disco
                 "line_total": float(lt),
                 "gross_line_total": float(gross_lt),
                 "discount_allocated": float(alloc_disc),
+                "original_unit_price": float(l.get("original_price", price) or price),
+                "line_discount": float(line_disc),
+                "product_barcode": str(product_snapshot["barcode"] if product_snapshot else l.get("barcode") or ""),
+                "product_category": str(product_snapshot["category"] if product_snapshot else l.get("category") or ""),
+                "cost_price": max(0.0, float(product_snapshot["cost_price"] if product_snapshot else l.get("cost_price") or 0.0)),
+                "supplier": str(product_snapshot["supplier"] if product_snapshot else l.get("supplier") or ""),
+                "product_brand": str(product_snapshot["brand"] if product_snapshot and "brand" in product_snapshot.keys() else l.get("brand") or ""),
+                "product_location": str(product_snapshot["location"] if product_snapshot and "location" in product_snapshot.keys() else l.get("location") or ""),
 
                 # common legacy variants
                 "unit_price_used": float(price),
                 "unit_price": float(price),
-                "discount": float(l.get("discount") or 0.0),
-                "discount_total": float(l.get("discount") or 0.0),
+                "discount": float(alloc_disc),
+                "discount_total": float(alloc_disc),
                 "subtotal": float(lt),
             }
 
@@ -3825,103 +4436,109 @@ def _range_bounds(which):
 
 
 def analytics_kpis_range(start_date, end_date):
-    """KPIs for analytics range.
-
-    IMPORTANT: For this POS we treat 'gross' as 'net' (net after returns).
-    We keep the key name 'gross_sales' for UI compatibility, but its value is NET sales.
-    """
+    """Manager-facing KPIs with explicit sales, tender, return, and item math."""
     conn = None
     try:
         conn = get_conn()
         cur = conn.cursor()
-
         s0, e1 = _sql_bounds_inclusive(start_date, end_date)
-
-        # Sales totals + orders
         cur.execute(
             """
             SELECT
-                COALESCE(SUM(
-                    CASE
-                        WHEN COALESCE(is_exchange,0)=1 THEN 0
-                        WHEN UPPER(COALESCE(payment_method,'')) IN ('EXCHANGE','STORE_CREDIT','CARD','DEBIT','CREDIT_CARD','WHISH') THEN 0
-                        ELSE COALESCE(cash_paid, 0)
-                    END
-                ), 0) AS sales_total,
-                COALESCE(SUM(store_credit_used), 0) AS credit_sales_total,
-                COALESCE(SUM(COALESCE(NULLIF(total_sales, 0), total_amount + store_credit_used, total_amount)), 0) AS merch_sales_total,
+                COALESCE(SUM(COALESCE(NULLIF(subtotal, 0), total_sales, total_amount)), 0) AS gross_sales,
+                COALESCE(SUM(discount_total), 0) AS discounts,
+                COALESCE(SUM(COALESCE(NULLIF(total_sales, 0), total_amount + store_credit_used, total_amount)), 0) AS merchandise_sales,
+                COALESCE(SUM(cash_paid), 0) AS cash_collected,
+                COALESCE(SUM(store_credit_used), 0) AS store_credit_used,
                 COUNT(*) AS orders
             FROM sales
             WHERE datetime(created_at) >= datetime(?)
               AND datetime(created_at) < datetime(?)
+              AND COALESCE(is_voided, 0) = 0
             """,
             (s0, e1),
         )
-        row = cur.fetchone()
-        row = dict(row) if row else {}  # sqlite3.Row -> dict (EXE-safe)
+        row = dict(cur.fetchone() or {})
 
-        sales_total = float(row.get("sales_total", 0.0) or 0.0)
-        credit_sales_total = float(row.get("credit_sales_total", 0.0) or 0.0)
-        merch_sales_total = float(row.get("merch_sales_total", 0.0) or 0.0)
-        orders = int(row.get("orders", 0) or 0)
-
-        # Items sold (does not subtract returns; kept simple and fast)
         cur.execute(
             """
-            SELECT COALESCE(SUM(qty), 0) AS items_sold
+            SELECT COALESCE(SUM(si.qty), 0) AS items_sold,
+                   COALESCE(SUM(si.qty * COALESCE(si.cost_price, 0)), 0) AS cogs
             FROM sale_items si
             JOIN sales s ON s.id = si.sale_id
-            WHERE COALESCE(s.is_exchange,0)=0
-              AND datetime(s.created_at) >= datetime(?)
+            WHERE datetime(s.created_at) >= datetime(?)
               AND datetime(s.created_at) < datetime(?)
+              AND COALESCE(s.is_voided, 0) = 0
             """,
             (s0, e1),
         )
-        items_sold = int(cur.fetchone()["items_sold"] or 0)
+        item_row = dict(cur.fetchone() or {})
+        cur.execute(
+            """
+            SELECT COALESCE(SUM(r.total_return_amount), 0) AS returns_total,
+                   COALESCE(SUM(r.cash_refund), 0) AS cash_refunds,
+                   COALESCE(SUM(r.credit_refund), 0) AS credit_refunds
+            FROM returns r
+            LEFT JOIN sales s ON s.id = r.original_sale_id
+            WHERE datetime(r.created_at) >= datetime(?)
+              AND datetime(r.created_at) < datetime(?)
+              AND COALESCE(r.is_voided, 0) = 0
+              AND COALESCE(s.is_voided, 0) = 0
+            """,
+            (s0, e1),
+        )
+        rrow = dict(cur.fetchone() or {})
+        cur.execute(
+            """
+            SELECT COALESCE(SUM(ri.qty), 0) AS items_returned,
+                   COALESCE(SUM(ri.qty * COALESCE(si.cost_price, 0)), 0) AS returned_cost
+            FROM return_items ri
+            JOIN returns r ON r.id = ri.return_id
+            LEFT JOIN sale_items si ON si.id = ri.sale_item_id
+            LEFT JOIN sales s ON s.id = r.original_sale_id
+            WHERE datetime(r.created_at) >= datetime(?)
+              AND datetime(r.created_at) < datetime(?)
+              AND COALESCE(r.is_voided, 0) = 0
+              AND COALESCE(s.is_voided, 0) = 0
+            """,
+            (s0, e1),
+        )
+        returned_item_row = dict(cur.fetchone() or {})
 
-        # Returns total (returns table)
-        try:
-            cur.execute(
-                """
-                SELECT COALESCE(SUM(total_return_amount), 0) AS returns_total,
-                       COALESCE(SUM(cash_refund), 0) AS cash_refunds,
-                       COALESCE(SUM(credit_refund), 0) AS credit_refunds
-                FROM returns
-                WHERE datetime(created_at) >= datetime(?)
-                  AND datetime(created_at) < datetime(?)
-                  AND COALESCE(is_voided, 0) = 0
-                """,
-                (s0, e1),
-            )
-            rrow = cur.fetchone()
-            rrow = dict(rrow) if rrow else {}  # sqlite3.Row -> dict (EXE-safe)
-            returns_total = float(rrow.get("returns_total", 0.0) or 0.0)
-            cash_refunds = float(rrow.get("cash_refunds", 0.0) or 0.0)
-            credit_refunds = float(rrow.get("credit_refunds", 0.0) or 0.0)
-        except Exception:
-            # If returns table doesn't exist, treat as zero
-            returns_total = 0.0
-            cash_refunds = 0.0
-            credit_refunds = 0.0
-
-        net_sales = merch_sales_total - returns_total
-        aov = (net_sales / orders) if orders else 0.0
-
-        # Keep keys stable for the UI
+        gross_sales = float(row.get("gross_sales", 0.0) or 0.0)
+        discounts = float(row.get("discounts", 0.0) or 0.0)
+        merchandise_sales = float(row.get("merchandise_sales", 0.0) or 0.0)
+        returns_total = float(rrow.get("returns_total", 0.0) or 0.0)
+        cash_refunds = float(rrow.get("cash_refunds", 0.0) or 0.0)
+        orders = int(row.get("orders", 0) or 0)
+        net_sales = merchandise_sales - returns_total
+        items_sold = int(item_row.get("items_sold", 0) or 0)
+        items_returned = int(returned_item_row.get("items_returned", 0) or 0)
+        net_items = items_sold - items_returned
+        net_cogs = float(item_row.get("cogs", 0.0) or 0.0) - float(returned_item_row.get("returned_cost", 0.0) or 0.0)
+        gross_profit = net_sales - net_cogs
+        # Average order value describes checkout baskets; later returns should not
+        # retroactively make the average basket look smaller.
+        aov = (merchandise_sales / orders) if orders else 0.0
         return {
-            "gross_sales": net_sales,   # gross == net (after returns)
+            "gross_sales": gross_sales,
+            "discounts": discounts,
             "net_sales": net_sales,
             "orders": orders,
-            "cash_sales_total": sales_total,
-            "store_credit_sales_total": credit_sales_total,
-            "merch_sales_total": merch_sales_total,
+            "cash_sales_total": float(row.get("cash_collected", 0.0) or 0.0) - cash_refunds,
+            "store_credit_sales_total": float(row.get("store_credit_used", 0.0) or 0.0),
+            "merch_sales_total": merchandise_sales,
             "returns_total": returns_total,
             "cash_refunds_total": cash_refunds,
-            "credit_refunds_total": credit_refunds,
-            "items_sold": items_sold,
+            "credit_refunds_total": float(rrow.get("credit_refunds", 0.0) or 0.0),
+            "items_sold": net_items,
+            "gross_items_sold": items_sold,
+            "items_returned": items_returned,
             "avg_order_value": aov,
             "returns": returns_total,
-            "discounts": 0.0,
+            "cogs": net_cogs,
+            "gross_profit": gross_profit,
+            "margin_pct": (gross_profit / net_sales * 100.0) if net_sales else 0.0,
         }
     finally:
         if conn:
@@ -3943,17 +4560,20 @@ def analytics_breakdown_range(start_date, end_date):
 
         cur.execute(
             """
-            SELECT COALESCE(SUM(COALESCE(NULLIF(total_sales, 0), total_amount + store_credit_used, total_amount)), 0) AS sales_total,
+            SELECT COALESCE(SUM(COALESCE(NULLIF(subtotal, 0), total_sales, total_amount)), 0) AS gross_total,
+                   COALESCE(SUM(COALESCE(NULLIF(total_sales, 0), total_amount + store_credit_used, total_amount)), 0) AS sales_total,
                    COALESCE(SUM(discount_total), 0) AS discounts_total,
                    COALESCE(SUM(shipping), 0) AS shipping_total,
                    COALESCE(SUM(tax_total), 0) AS taxes_total
             FROM sales
             WHERE datetime(created_at) >= datetime(?)
               AND datetime(created_at) < datetime(?)
+              AND COALESCE(is_voided, 0) = 0
             """,
             (s0, e1),
         )
         sales_row = cur.fetchone()
+        gross_total = float(sales_row["gross_total"] or 0.0)
         sales_total = float(sales_row["sales_total"] or 0.0)
         discounts = float(sales_row["discounts_total"] or 0.0)
         shipping = float(sales_row["shipping_total"] or 0.0)
@@ -3962,48 +4582,75 @@ def analytics_breakdown_range(start_date, end_date):
         try:
             cur.execute(
                 """
-                SELECT COALESCE(SUM(total_return_amount), 0) AS returns_total
-                FROM returns
-                WHERE datetime(created_at) >= datetime(?)
-                  AND datetime(created_at) < datetime(?)
-                  AND COALESCE(is_voided, 0) = 0
+                SELECT COALESCE(SUM(total_return_amount), 0) AS returns_total,
+                       COALESCE(SUM(cash_refund), 0) AS cash_refunds
+                FROM returns r
+                LEFT JOIN sales s ON s.id = r.original_sale_id
+                WHERE datetime(r.created_at) >= datetime(?)
+                  AND datetime(r.created_at) < datetime(?)
+                  AND COALESCE(r.is_voided, 0) = 0
+                  AND COALESCE(s.is_voided, 0) = 0
                 """,
                 (s0, e1),
             )
-            returns_total = float(cur.fetchone()["returns_total"] or 0.0)
+            return_summary = cur.fetchone()
+            returns_total = float(return_summary["returns_total"] or 0.0)
+            cash_refunds = float(return_summary["cash_refunds"] or 0.0)
         except Exception:
             returns_total = 0.0
+            cash_refunds = 0.0
 
         pm_breakdown = {}
         try:
             cur.execute(
                 """
-                SELECT COALESCE(payment_method, 'CASH') AS pm,
-                       COALESCE(SUM(COALESCE(NULLIF(total_sales, 0), total_amount + store_credit_used, total_amount)), 0) AS pm_total
+                SELECT payment_method, total_sales, total_amount, cash_paid,
+                       store_credit_used, notes
                 FROM sales
                 WHERE datetime(created_at) >= datetime(?)
                   AND datetime(created_at) < datetime(?)
-                GROUP BY COALESCE(payment_method, 'CASH')
-                """,
-                (s0, e1),
+                  AND COALESCE(is_voided, 0) = 0
+                """, (s0, e1),
             )
             for r in cur.fetchall():
-                pm_breakdown[str(r["pm"]).upper()] = float(r["pm_total"] or 0.0)
+                pm = str(r["payment_method"] or "CASH").upper()
+                notes = str(r["notes"] or "")
+                merch = float(r["total_sales"] or r["total_amount"] or 0.0)
+                credit = max(0.0, float(r["store_credit_used"] or 0.0))
+                cash = max(0.0, float(r["cash_paid"] or 0.0))
+                whish = max(0.0, _note_float(notes, "PAYMENT_WHISH", 0.0))
+                card = max(0.0, _note_float(notes, "PAYMENT_CARD", 0.0))
+                due = max(0.0, merch - credit)
+                if pm == "WHISH" and whish <= 0.005:
+                    whish = due
+                if pm in ("CARD", "DEBIT", "CREDIT_CARD") and card <= 0.005:
+                    card = due
+                if cash > 0.005:
+                    pm_breakdown["Cash"] = pm_breakdown.get("Cash", 0.0) + cash
+                if whish > 0.005:
+                    pm_breakdown["Whish"] = pm_breakdown.get("Whish", 0.0) + whish
+                if card > 0.005:
+                    pm_breakdown["Card"] = pm_breakdown.get("Card", 0.0) + card
+                if credit > 0.005:
+                    pm_breakdown["Store credit"] = pm_breakdown.get("Store credit", 0.0) + credit
         except Exception:
             pass
+        if cash_refunds > 0.005 and "Cash" in pm_breakdown:
+            pm_breakdown["Cash"] = max(0.0, pm_breakdown["Cash"] - cash_refunds)
 
         cat_breakdown = {}
         try:
             cur.execute(
                 """
-                SELECT COALESCE(p.category, 'Uncategorized') AS cat,
+                SELECT COALESCE(NULLIF(si.product_category, ''), NULLIF(p.category, ''), 'Uncategorized') AS cat,
                        COALESCE(SUM(si.line_total), 0) AS cat_total
                 FROM sale_items si
                 JOIN sales s ON si.sale_id = s.id
                 LEFT JOIN products p ON si.product_id = p.id
                 WHERE datetime(s.created_at) >= datetime(?)
                   AND datetime(s.created_at) < datetime(?)
-                GROUP BY COALESCE(p.category, 'Uncategorized')
+                  AND COALESCE(s.is_voided, 0) = 0
+                GROUP BY COALESCE(NULLIF(si.product_category, ''), NULLIF(p.category, ''), 'Uncategorized')
                 ORDER BY cat_total DESC
                 """,
                 (s0, e1),
@@ -4016,9 +4663,8 @@ def analytics_breakdown_range(start_date, end_date):
         net_sales = sales_total - returns_total
         total_sales = net_sales  # keep it simple
 
-        # 'gross_sales' intentionally equals net_sales
         return {
-            "gross_sales": net_sales,
+            "gross_sales": gross_total,
             "discounts": discounts,
             "returns": returns_total,
             "shipping": shipping,
@@ -4047,15 +4693,15 @@ def analytics_series_in_range(start_date, end_date, group="day"):
 
         if group == "hour":
             label_sales = "strftime('%Y-%m-%d %H:00', created_at)"
-            label_returns = "strftime('%Y-%m-%d %H:00', created_at)"
+            label_returns = "strftime('%Y-%m-%d %H:00', r.created_at)"
             order_by = "label"
         elif group == "month":
             label_sales = "strftime('%Y-%m', created_at)"
-            label_returns = "strftime('%Y-%m', created_at)"
+            label_returns = "strftime('%Y-%m', r.created_at)"
             order_by = "label"
         else:
             label_sales = "strftime('%Y-%m-%d', created_at)"
-            label_returns = "strftime('%Y-%m-%d', created_at)"
+            label_returns = "strftime('%Y-%m-%d', r.created_at)"
             order_by = "label"
 
         # Sales grouped
@@ -4068,6 +4714,7 @@ def analytics_series_in_range(start_date, end_date, group="day"):
             FROM sales
             WHERE datetime(created_at) >= datetime(?)
               AND datetime(created_at) < datetime(?)
+              AND COALESCE(is_voided, 0) = 0
             GROUP BY label
             ORDER BY {order_by} ASC
             """,
@@ -4090,10 +4737,12 @@ def analytics_series_in_range(start_date, end_date, group="day"):
                 SELECT
                     {label_returns} AS label,
                     COALESCE(SUM(total_return_amount), 0) AS returns_total
-                FROM returns
-                WHERE datetime(created_at) >= datetime(?)
-                  AND datetime(created_at) < datetime(?)
-                  AND COALESCE(is_voided, 0) = 0
+                FROM returns r
+                LEFT JOIN sales s ON s.id = r.original_sale_id
+                WHERE datetime(r.created_at) >= datetime(?)
+                  AND datetime(r.created_at) < datetime(?)
+                  AND COALESCE(r.is_voided, 0) = 0
+                  AND COALESCE(s.is_voided, 0) = 0
                 GROUP BY label
                 ORDER BY {order_by} ASC
                 """,
@@ -4117,6 +4766,7 @@ def analytics_series_in_range(start_date, end_date, group="day"):
             out.append({
                 "label": lab,
                 "revenue": net,
+                "order_value_sales": sales_total,
                 "orders": by_label[lab]["orders"],
             })
         return out
@@ -4167,8 +4817,8 @@ def analytics_top_products_range(start_date, end_date, limit=12):
             SELECT
                 si.product_id AS product_id,
                 si.name AS name,
-                p.barcode AS barcode,
-                p.category AS category,
+                COALESCE(NULLIF(si.product_barcode, ''), p.barcode) AS barcode,
+                COALESCE(NULLIF(si.product_category, ''), p.category) AS category,
                 p.brand AS brand,
                 p.stock_qty AS current_stock,
                 COALESCE(SUM(si.qty), 0) AS qty_sold,
@@ -4180,7 +4830,11 @@ def analytics_top_products_range(start_date, end_date, limit=12):
             LEFT JOIN products p ON p.id = si.product_id
             WHERE datetime(s.created_at) >= datetime(?)
               AND datetime(s.created_at) < datetime(?)
-            GROUP BY si.product_id, si.name, p.barcode, p.category, p.brand, p.stock_qty
+              AND COALESCE(s.is_voided, 0) = 0
+            GROUP BY si.product_id, si.name,
+                     COALESCE(NULLIF(si.product_barcode, ''), p.barcode),
+                     COALESCE(NULLIF(si.product_category, ''), p.category),
+                     p.brand, p.stock_qty
             """,
             (s0, e1),
         )
@@ -4207,19 +4861,25 @@ def analytics_top_products_range(start_date, end_date, limit=12):
                 SELECT
                     ri.product_id AS product_id,
                     ri.name AS name,
-                    p.barcode AS barcode,
-                    p.category AS category,
+                    COALESCE(NULLIF(si.product_barcode, ''), p.barcode) AS barcode,
+                    COALESCE(NULLIF(si.product_category, ''), p.category) AS category,
                     p.brand AS brand,
                     p.stock_qty AS current_stock,
                     COALESCE(SUM(ri.qty), 0) AS qty_returned,
                     COALESCE(SUM(ri.line_total), 0) AS return_amount
                 FROM return_items ri
                 JOIN returns r ON r.id = ri.return_id
+                LEFT JOIN sale_items si ON si.id = ri.sale_item_id
+                LEFT JOIN sales s ON s.id = r.original_sale_id
                 LEFT JOIN products p ON p.id = ri.product_id
                 WHERE datetime(r.created_at) >= datetime(?)
                   AND datetime(r.created_at) < datetime(?)
                   AND COALESCE(r.is_voided, 0) = 0
-                GROUP BY ri.product_id, ri.name, p.barcode, p.category, p.brand, p.stock_qty
+                  AND COALESCE(s.is_voided, 0) = 0
+                GROUP BY ri.product_id, ri.name,
+                         COALESCE(NULLIF(si.product_barcode, ''), p.barcode),
+                         COALESCE(NULLIF(si.product_category, ''), p.category),
+                         p.brand, p.stock_qty
                 """,
                 (s0, e1),
             )
@@ -4279,6 +4939,127 @@ def analytics_low_stock(limit=50):
     finally:
         if conn:
             conn.close()
+
+
+def data_health_summary(sample_limit=8):
+    """Return actionable integrity checks; intentional blank catalog fields are ignored."""
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        limit = max(1, min(int(sample_limit or 8), 25))
+        issues = []
+
+        def add(key, title, count, severity, explanation, samples=None):
+            issues.append({
+                "key": key, "title": title, "count": int(count or 0),
+                "severity": severity if int(count or 0) else "OK",
+                "explanation": explanation,
+                "samples": [str(x) for x in (samples or []) if str(x).strip()][:limit],
+            })
+
+        integrity = str(cur.execute("PRAGMA quick_check").fetchone()[0] or "")
+        add("database", "Database integrity", 0 if integrity.lower() == "ok" else 1, "CRITICAL",
+            "SQLite structural check. This should always say OK.", [] if integrity.lower() == "ok" else [integrity])
+
+        fk_rows = cur.execute("PRAGMA foreign_key_check").fetchall()
+        add("foreign_keys", "Broken database references", len(fk_rows), "HIGH",
+            "Rows pointing to missing employees, sales, products, returns, or shifts.",
+            [f"{r[0]} row {r[1]} -> {r[2]}" for r in fk_rows])
+
+        rows = cur.execute(
+            "SELECT name, stock_qty FROM products WHERE COALESCE(is_deleted,0)=0 AND stock_qty < 0 ORDER BY stock_qty ASC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        count = cur.execute("SELECT COUNT(*) FROM products WHERE COALESCE(is_deleted,0)=0 AND stock_qty < 0").fetchone()[0]
+        add("negative_stock", "Products with negative stock", count, "HIGH",
+            "These products were sold or adjusted below zero and need a stock count.",
+            [f"{r['name']}: {r['stock_qty']}" for r in rows])
+
+        rows = cur.execute(
+            "SELECT name, sell_price FROM products WHERE COALESCE(is_deleted,0)=0 AND sell_price <= 0 ORDER BY name LIMIT ?",
+            (limit,),
+        ).fetchall()
+        count = cur.execute("SELECT COUNT(*) FROM products WHERE COALESCE(is_deleted,0)=0 AND sell_price <= 0").fetchone()[0]
+        add("invalid_price", "Products with zero/negative price", count, "HIGH",
+            "These can create free or negative-value sales unless intentionally corrected.",
+            [f"{r['name']}: {float(r['sell_price'] or 0):.2f}" for r in rows])
+
+        duplicate_rows = cur.execute(
+            """
+            SELECT LOWER(TRIM(name)) AS normalized, COUNT(*) AS n,
+                   GROUP_CONCAT(name, ' | ') AS names
+            FROM products WHERE COALESCE(is_deleted,0)=0
+            GROUP BY LOWER(TRIM(name)) HAVING COUNT(*) > 1
+            ORDER BY n DESC, normalized LIMIT ?
+            """, (limit,),
+        ).fetchall()
+        duplicate_count = cur.execute(
+            """SELECT COUNT(*) FROM (
+                SELECT 1 FROM products WHERE COALESCE(is_deleted,0)=0
+                GROUP BY LOWER(TRIM(name)) HAVING COUNT(*) > 1
+            )"""
+        ).fetchone()[0]
+        add("duplicate_names", "Duplicate active product names", duplicate_count, "MEDIUM",
+            "Separate barcodes may be valid, but identical names make selection and analytics unclear.",
+            [f"{r['names']} ({r['n']} rows)" for r in duplicate_rows])
+
+        broken_rows = cur.execute(
+            """
+            SELECT si.name, COUNT(*) AS n
+            FROM sale_items si LEFT JOIN products p ON p.id = si.product_id
+            WHERE si.product_id IS NULL OR p.id IS NULL
+            GROUP BY si.name ORDER BY n DESC, si.name LIMIT ?
+            """, (limit,),
+        ).fetchall()
+        broken_count = cur.execute(
+            """SELECT COUNT(*) FROM sale_items si LEFT JOIN products p ON p.id=si.product_id
+               WHERE si.product_id IS NULL OR p.id IS NULL"""
+        ).fetchone()[0]
+        add("broken_sale_products", "Historical sale lines missing a product link", broken_count, "MEDIUM",
+            "Receipts remain valid, but product/category analytics cannot fully identify these older lines.",
+            [f"{r['name']}: {r['n']} sale lines" for r in broken_rows])
+
+        dup_receipt_rows = cur.execute(
+            """
+            SELECT receipt_date, receipt_code, COUNT(*) AS n
+            FROM sales
+            WHERE TRIM(COALESCE(receipt_code,'')) <> ''
+            GROUP BY receipt_date, receipt_code HAVING COUNT(*) > 1
+            ORDER BY receipt_date DESC, receipt_code LIMIT ?
+            """, (limit,),
+        ).fetchall()
+        dup_receipt_count = cur.execute(
+            """SELECT COUNT(*) FROM (
+                SELECT 1 FROM sales WHERE TRIM(COALESCE(receipt_code,'')) <> ''
+                GROUP BY receipt_date, receipt_code HAVING COUNT(*) > 1
+            )"""
+        ).fetchone()[0]
+        add("duplicate_receipts", "Duplicate receipt identities", dup_receipt_count, "HIGH",
+            "The same date and receipt number appears more than once and may confuse reprints.",
+            [f"{r['receipt_date']} / {r['receipt_code']}: {r['n']} sales" for r in dup_receipt_rows])
+
+        no_item_count = cur.execute(
+            "SELECT COUNT(*) FROM sales s LEFT JOIN sale_items si ON si.sale_id=s.id WHERE si.id IS NULL"
+        ).fetchone()[0]
+        add("sales_without_items", "Sales with no item lines", no_item_count, "HIGH",
+            "A sale header without items cannot produce trustworthy item analytics.")
+
+        void_reason_count = cur.execute(
+            """SELECT COUNT(*) FROM sales
+               WHERE COALESCE(is_voided,0)=1 AND TRIM(COALESCE(void_reason,''))=''"""
+        ).fetchone()[0]
+        add("void_reason", "Voided sales missing a reason", void_reason_count, "MEDIUM",
+            "Every void should explain why it happened.")
+
+        problem_count = sum(1 for issue in issues if issue["count"] > 0)
+        return {
+            "ok": problem_count == 0,
+            "problem_count": problem_count,
+            "checked_at": _now_iso(),
+            "issues": issues,
+        }
+    finally:
+        conn.close()
 
 
 def cancel_sale_and_restore_stock(sale_id: int):
@@ -4379,3 +5160,248 @@ def db_self_test():
     except Exception as e:
         result["error"] = str(e)
         return result
+
+
+# ---------------- DATA HEALTH & REPAIR TOOLS ----------------
+
+def get_distinct_categories():
+    conn = None
+    try:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("SELECT DISTINCT category FROM products WHERE category IS NOT NULL AND category != '' AND is_deleted = 0 ORDER BY category ASC")
+        return [r[0] for r in cur.fetchall()]
+    except Exception:
+        return []
+    finally:
+        if conn:
+            conn.close()
+
+
+def get_data_health_stats():
+    conn = None
+    try:
+        conn = get_conn()
+        cur = conn.cursor()
+        
+        # Negative Stock
+        cur.execute("SELECT COUNT(*) FROM products WHERE stock_qty < 0 AND is_deleted = 0")
+        neg_stock = int(cur.fetchone()[0] or 0)
+        
+        # Missing Category
+        cur.execute("SELECT COUNT(*) FROM products WHERE (category IS NULL OR category = '') AND is_deleted = 0")
+        miss_cat = int(cur.fetchone()[0] or 0)
+        
+        # Missing Location
+        cur.execute("SELECT COUNT(*) FROM products WHERE (location IS NULL OR location = '') AND is_deleted = 0")
+        miss_loc = int(cur.fetchone()[0] or 0)
+        
+        # Duplicate Names
+        cur.execute("SELECT COUNT(*) FROM (SELECT name FROM products WHERE is_deleted = 0 GROUP BY name HAVING COUNT(*) > 1)")
+        dup_names = int(cur.fetchone()[0] or 0)
+        
+        # Broken links: sale_items where product_id is not null but product doesn't exist
+        cur.execute("SELECT COUNT(*) FROM sale_items si LEFT JOIN products p ON p.id = si.product_id WHERE si.product_id IS NOT NULL AND p.id IS NULL")
+        broken_links = int(cur.fetchone()[0] or 0)
+        
+        # Total Products
+        cur.execute("SELECT COUNT(*) FROM products WHERE is_deleted = 0")
+        total_prod = int(cur.fetchone()[0] or 0)
+        
+        return {
+            "negative_stock": neg_stock,
+            "missing_category": miss_cat,
+            "missing_location": miss_loc,
+            "duplicate_names": dup_names,
+            "broken_links": broken_links,
+            "total_products": total_prod
+        }
+    except Exception:
+        return {
+            "negative_stock": 0,
+            "missing_category": 0,
+            "missing_location": 0,
+            "duplicate_names": 0,
+            "broken_links": 0,
+            "total_products": 0
+        }
+    finally:
+        if conn:
+            conn.close()
+
+
+def list_health_issues(issue_type):
+    conn = None
+    try:
+        conn = get_conn()
+        cur = conn.cursor()
+        if issue_type == "negative_stock":
+            cur.execute("SELECT * FROM products WHERE stock_qty < 0 AND is_deleted = 0 ORDER BY name ASC")
+            return [dict(r) for r in cur.fetchall()]
+        elif issue_type == "missing_category":
+            cur.execute("SELECT * FROM products WHERE (category IS NULL OR category = '') AND is_deleted = 0 ORDER BY name ASC")
+            return [dict(r) for r in cur.fetchall()]
+        elif issue_type == "missing_location":
+            cur.execute("SELECT * FROM products WHERE (location IS NULL OR location = '') AND is_deleted = 0 ORDER BY name ASC")
+            return [dict(r) for r in cur.fetchall()]
+        elif issue_type == "duplicate_names":
+            cur.execute("SELECT name, COUNT(*) as count FROM products WHERE is_deleted = 0 GROUP BY name HAVING COUNT(*) > 1 ORDER BY name ASC")
+            dup_groups = cur.fetchall()
+            out = []
+            for g in dup_groups:
+                cur.execute("SELECT * FROM products WHERE name = ? AND is_deleted = 0", (g["name"],))
+                for r in cur.fetchall():
+                    out.append(dict(r))
+            return out
+        elif issue_type == "broken_links":
+            cur.execute("""
+                SELECT si.name, si.product_barcode, COUNT(*) as occurrence_count, GROUP_CONCAT(si.id) as item_ids
+                FROM sale_items si
+                LEFT JOIN products p ON p.id = si.product_id
+                WHERE si.product_id IS NOT NULL AND p.id IS NULL
+                GROUP BY si.name, si.product_barcode
+                ORDER BY si.name ASC
+            """)
+            return [dict(r) for r in cur.fetchall()]
+        return []
+    except Exception:
+        return []
+    finally:
+        if conn:
+            conn.close()
+
+
+def bulk_update_products(product_ids, category=None, location=None, low_stock=None, brand=None):
+    if not product_ids:
+        return False
+    conn = None
+    try:
+        conn = get_conn()
+        cur = conn.cursor()
+        
+        updates = []
+        params = []
+        if category is not None:
+            updates.append("category = ?")
+            params.append(str(category).strip())
+        if location is not None:
+            updates.append("location = ?")
+            params.append(str(location).strip())
+        if low_stock is not None:
+            updates.append("low_stock_level = ?")
+            params.append(int(low_stock))
+        if brand is not None:
+            updates.append("brand = ?")
+            params.append(str(brand).strip())
+            
+        if not updates:
+            return False
+            
+        sql = f"UPDATE products SET {', '.join(updates)} WHERE id = ?"
+        for pid in product_ids:
+            cur.execute(sql, params + [int(pid)])
+            
+        conn.commit()
+        return True
+    except Exception:
+        if conn:
+            conn.rollback()
+        return False
+    finally:
+        if conn:
+            conn.close()
+
+
+def repair_broken_product_links(sale_item_ids, target_product_id):
+    if not sale_item_ids or not target_product_id:
+        return False
+    conn = None
+    try:
+        conn = get_conn()
+        cur = conn.cursor()
+        
+        prod = cur.execute(
+            "SELECT barcode, category, brand, location, cost_price, supplier FROM products WHERE id = ? LIMIT 1",
+            (int(target_product_id),)
+        ).fetchone()
+        if not prod:
+            return False
+            
+        if isinstance(sale_item_ids, str):
+            ids = [int(x) for x in sale_item_ids.split(",") if x.strip()]
+        else:
+            ids = [int(x) for x in sale_item_ids]
+            
+        for si_id in ids:
+            cur.execute("""
+                UPDATE sale_items
+                SET product_id = ?, product_barcode = ?, product_category = ?, cost_price = ?, supplier = ?, product_brand = ?, product_location = ?
+                WHERE id = ?
+            """, (
+                int(target_product_id),
+                str(prod["barcode"] or ""),
+                str(prod["category"] or ""),
+                float(prod["cost_price"] or 0.0),
+                str(prod["supplier"] or ""),
+                str(prod["brand"] or ""),
+                str(prod["location"] or ""),
+                int(si_id)
+            ))
+        conn.commit()
+        return True
+    except Exception:
+        if conn:
+            conn.rollback()
+        return False
+    finally:
+        if conn:
+            conn.close()
+
+
+def recreate_and_repair_product(name, barcode, sell_price, cost_price, supplier, category, brand, location, sale_item_ids):
+    conn = None
+    try:
+        conn = get_conn()
+        cur = conn.cursor()
+        
+        pid_barcode = add_product(
+            name=name, category=category, brand=brand, sell_price=sell_price,
+            stock_qty=0, low_stock_level=0, barcode=barcode, location=location,
+            cost_price=cost_price, supplier=supplier
+        )
+        
+        prod = cur.execute("SELECT id FROM products WHERE barcode = ? LIMIT 1", (pid_barcode,)).fetchone()
+        if not prod:
+            return False
+        pid = int(prod["id"])
+        
+        if isinstance(sale_item_ids, str):
+            ids = [int(x) for x in sale_item_ids.split(",") if x.strip()]
+        else:
+            ids = [int(x) for x in sale_item_ids]
+            
+        for si_id in ids:
+            cur.execute("""
+                UPDATE sale_items
+                SET product_id = ?, product_barcode = ?, product_category = ?, cost_price = ?, supplier = ?, product_brand = ?, product_location = ?
+                WHERE id = ?
+            """, (
+                pid,
+                str(barcode),
+                str(category),
+                float(cost_price),
+                str(supplier),
+                str(brand),
+                str(location),
+                int(si_id)
+            ))
+            
+        conn.commit()
+        return True
+    except Exception:
+        if conn:
+            conn.rollback()
+        return False
+    finally:
+        if conn:
+            conn.close()

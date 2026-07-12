@@ -12,7 +12,7 @@ from pathlib import Path
 import requests
 
 
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.3.2"
 GITHUB_REPO = "dani01kh/mask-pos"
 LATEST_RELEASE_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 
@@ -25,6 +25,7 @@ PROTECTED_FILES = {
     "cloud_sync_device.json",
     "config.json",
     "maskpos.lock",
+    "cashier_recovery.json",
 }
 PROTECTED_DIRS = {
     "backups",
@@ -70,6 +71,18 @@ def check_for_update(timeout: int = 10) -> dict:
         },
         timeout=timeout,
     )
+    if response.status_code == 404:
+        return {
+            "available": False,
+            "current_version": APP_VERSION,
+            "version": APP_VERSION,
+            "tag_name": "",
+            "release_name": "",
+            "notes": "No releases found on GitHub.",
+            "asset_name": "",
+            "download_url": "",
+            "html_url": "",
+        }
     response.raise_for_status()
     release = response.json() or {}
     tag = str(release.get("tag_name") or release.get("name") or "").strip()

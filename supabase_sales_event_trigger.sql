@@ -151,6 +151,18 @@ begin
     limit 1;
 
     if cloud_sale_id is null then
+        select id into cloud_sale_id
+        from public.sales
+        where cloud_device_id = new.device_id
+          and cloud_local_id = coalesce(new.entity_id, p->>'sale_id', s->>'id')
+        limit 1;
+    end if;
+
+    if cloud_sale_id is not null then
+        return new;
+    end if;
+
+    if cloud_sale_id is null then
         lock table public.sales in exclusive mode;
         cloud_sale_id := public.maskpos_next_table_id('sales');
     end if;
@@ -327,6 +339,18 @@ begin
     from public.returns
     where cloud_event_id = new.event_id
     limit 1;
+
+    if cloud_return_id is null then
+        select id into cloud_return_id
+        from public.returns
+        where cloud_device_id = new.device_id
+          and cloud_local_id = coalesce(new.entity_id, p->>'return_id')
+        limit 1;
+    end if;
+
+    if cloud_return_id is not null then
+        return new;
+    end if;
 
     if cloud_return_id is null then
         lock table public.returns in exclusive mode;
