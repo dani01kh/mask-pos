@@ -1315,12 +1315,8 @@ def init_db():
 
         # Quick items are temporary catalog rows created for receipt compatibility.
         # Older builds deducted their stock from zero and left them visible forever.
-        cur.execute("""
-            UPDATE products
-            SET stock_qty = 0, is_deleted = 1
-            WHERE LOWER(TRIM(COALESCE(category, ''))) = 'quick'
-              AND stock_qty <= 0
-        """)
+        # (Disabled automatic deletion to prevent deactivating active products named 'Quick')
+
 
         _repair_open_shifts(cur)
 

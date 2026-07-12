@@ -12,7 +12,7 @@ from pathlib import Path
 import requests
 
 
-APP_VERSION = "1.3.3"
+APP_VERSION = "1.3.4"
 GITHUB_REPO = "dani01kh/mask-pos"
 LATEST_RELEASE_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 

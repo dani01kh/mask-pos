@@ -565,8 +565,7 @@ def _product_payload_for_cloud(payload: dict) -> dict:
     category = str(payload.get("category") or "").strip()
     stock_qty = max(0, int(payload.get("stock_qty") or 0))
     is_deleted = int(payload.get("is_deleted") or 0)
-    if category.lower() == "quick" and stock_qty <= 0:
-        is_deleted = 1
+
     out = {
         "barcode": barcode,
         "name": str(payload.get("name") or "Cloud item").strip() or "Cloud item",
@@ -1233,8 +1232,7 @@ def _apply_product_event(db_path: Path, event: dict, payload: dict) -> str:
         cost_price = max(0.0, float(payload.get("cost_price") if payload.get("cost_price") is not None else (row["cost_price"] if row and "cost_price" in row.keys() else 0)))
         supplier = str(payload.get("supplier") if payload.get("supplier") is not None else (row["supplier"] if row and "supplier" in row.keys() else "")).strip()
         is_deleted = int(payload.get("is_deleted") if payload.get("is_deleted") is not None else 0)
-        if category.lower() == "quick" and stock_qty <= 0:
-            is_deleted = 1
+
 
         if row:
             cur.execute("""
