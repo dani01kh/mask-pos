@@ -1828,19 +1828,25 @@ class MaskPOS(tk.Tk):
                     set_status("Update downloaded but not installed.")
                     return
                 try:
+                    if backend_mode() != "connect":
+                        set_status("Creating a safety backup before updating...")
+                        if not backup_pos_db(upload_offsite=False):
+                            raise RuntimeError(
+                                "The safety backup could not be verified, so the update was cancelled. "
+                                "Your current app and database were not changed."
+                            )
+
                     set_status("Installing update...")
                     app_update.launch_installer(
                         zip_path,
                         BASE_DIR,
                         restart_exe=sys.executable,
                         parent_pid=os.getpid(),
+                        expected_version=str(info.get("version") or ""),
+                        expected_sha256=str(info.get("asset_sha256") or ""),
                     )
                     try:
                         stop_backend()
-                    except Exception:
-                        pass
-                    try:
-                        backup_pos_db()
                     except Exception:
                         pass
                     try:

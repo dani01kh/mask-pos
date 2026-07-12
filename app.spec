@@ -94,6 +94,7 @@ runtime_files = [
     "products.csv",
     "SumatraPDF.exe",
     "SumatraPDF-settings.txt",
+    "scripts/install_maskpos_update.ps1",
 ]
 
 for f in runtime_files:

@@ -66,6 +66,7 @@ runtime_files = [
     "PdfPreview.dll",
     "PdfFilter.dll",
     "libmupdf.dll",
+    "scripts/install_maskpos_update.ps1",
 ]
 
 for f in runtime_files:
