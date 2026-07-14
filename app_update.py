@@ -366,11 +366,15 @@ def launch_installer(
         )
 
     ready = False
-    deadline = time.time() + 5.0
+    # Windows PowerShell 5.1 can take several seconds to initialize on older
+    # store PCs or while antivirus scans the copied script.
+    deadline = time.time() + 15.0
     while time.time() < deadline:
         if result_path.is_file():
             try:
-                state = json.loads(result_path.read_text(encoding="utf-8")) or {}
+                # Windows PowerShell 5.1's `Set-Content -Encoding UTF8` writes
+                # a BOM. utf-8-sig accepts that output as well as BOM-less JSON.
+                state = json.loads(result_path.read_text(encoding="utf-8-sig")) or {}
                 marker = str(state.get("state") or state.get("status") or "").strip().lower()
                 if marker in {"waiting_for_parent", "ready", "running"}:
                     ready = True
