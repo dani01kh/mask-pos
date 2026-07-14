@@ -381,6 +381,14 @@ async function applySale(db, event, payload) {
     existing = await db.prepare("SELECT id FROM sales WHERE cloud_device_id = ? AND cloud_local_id = ? LIMIT 1")
       .bind(event.device_id, text(event.entity_id || payload.sale_id)).first();
   }
+  // A host may receive a new device id after a reinstall/database recovery. In
+  // that case backfill events have new IDs even though the receipt already
+  // exists. Receipt numbers are date-scoped, so this is the stable sale key.
+  if (!existing && s.receipt_date && s.receipt_code) {
+    existing = await db.prepare(
+      "SELECT id FROM sales WHERE receipt_date = ? AND receipt_code = ? LIMIT 1"
+    ).bind(text(s.receipt_date), text(s.receipt_code)).first();
+  }
   if (existing) return;
   let saleId = existing && existing.id;
   const shiftId = await mappedId(db, "cash_shifts", event.device_id, s.shift_id);
