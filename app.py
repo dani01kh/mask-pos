@@ -349,6 +349,7 @@ from backend import (
     set_seasonal_sale_enabled,
     get_seasonal_sales_map,
     set_seasonal_sale_item,
+    set_seasonal_sale_price_item,
     remove_seasonal_sale_item,
     clear_seasonal_sales,
     get_bundle_offers_enabled,
@@ -3619,12 +3620,22 @@ class CashierPage(tk.Frame):
             bc_key = str(barcode).strip()
 
         sale_pct = 0.0
+        sale_unit_price = 0.0
         try:
             if bool(get_seasonal_sale_enabled()):
-                sale_pct = float(get_seasonal_sales_map().get(bc_key) or 0.0)
+                sale_offer = get_seasonal_sales_map().get(bc_key) or {}
+                if isinstance(sale_offer, dict) and str(sale_offer.get("type") or "").lower() == "price":
+                    sale_unit_price = float(sale_offer.get("price") or 0.0)
+                elif isinstance(sale_offer, dict):
+                    sale_pct = float(sale_offer.get("pct") or 0.0)
+                else:
+                    sale_pct = float(sale_offer or 0.0)
         except Exception:
             sale_pct = 0.0
+            sale_unit_price = 0.0
         sale_pct = max(0.0, min(100.0, sale_pct))
+        if sale_unit_price <= 0.0 or sale_unit_price >= price:
+            sale_unit_price = 0.0
 
         line = {
             "product_id": product_id,
@@ -3635,7 +3646,9 @@ class CashierPage(tk.Frame):
             "qty": qty_to_add,
             "discount_pct": float(sale_pct if sale_pct > 0 else 0.0),
             "sale_pct": float(sale_pct if sale_pct > 0 else 0.0),
-            "sale_applied": bool(sale_pct > 0),
+            "sale_unit_price": float(sale_unit_price),
+            "sale_kind": "price" if sale_unit_price > 0 else ("percent" if sale_pct > 0 else ""),
+            "sale_applied": bool(sale_pct > 0 or sale_unit_price > 0),
             "manual_override": False,
         }
         self._recalc_line(line)
@@ -3663,6 +3676,19 @@ class CashierPage(tk.Frame):
         disc = max(0.0, min(100.0, disc))
         line["discount_pct"] = disc
         line_total = whole_money_round_up(price * qty * (1.0 - disc / 100.0))
+
+        if bool(line.get("sale_applied", False)) and str(line.get("sale_kind") or "") == "price":
+            try:
+                fixed_unit = float(line.get("sale_unit_price") or 0.0)
+            except Exception:
+                fixed_unit = 0.0
+            if 0.0 < fixed_unit < price:
+                line_total = whole_money_round_up(fixed_unit * qty)
+                line["discount_pct"] = max(0.0, min(100.0, (price - fixed_unit) / price * 100.0)) if price > 0 else 0.0
+            else:
+                line["sale_applied"] = False
+                line["sale_unit_price"] = 0.0
+                line["sale_kind"] = ""
 
         if bool(line.get("bundle_offer_applied", False)):
             try:
@@ -3797,6 +3823,8 @@ class CashierPage(tk.Frame):
                 # Once manually edited, we stop considering it a seasonal-sale-managed line
                 line["sale_applied"] = False
                 line["sale_pct"] = 0.0
+                line["sale_unit_price"] = 0.0
+                line["sale_kind"] = ""
                 line["bundle_offer_applied"] = False
                 line["bundle_offer_qty"] = 0
                 line["bundle_offer_price"] = 0.0
@@ -4008,14 +4036,36 @@ class CashierPage(tk.Frame):
                 qty = 0
 
             pct = 0.0
+            fixed_unit = 0.0
+            sale_kind = ""
             if seasonal_enabled and bc:
                 try:
-                    pct = float(sale_map.get(bc) or 0.0)
+                    sale_offer = sale_map.get(bc) or {}
+                    if isinstance(sale_offer, dict) and str(sale_offer.get("type") or "").lower() == "price":
+                        fixed_unit = float(sale_offer.get("price") or 0.0)
+                        sale_kind = "price"
+                    elif isinstance(sale_offer, dict):
+                        pct = float(sale_offer.get("pct") or 0.0)
+                        sale_kind = "percent"
+                    else:
+                        pct = float(sale_offer or 0.0)
+                        sale_kind = "percent"
                 except Exception:
                     pct = 0.0
+                    fixed_unit = 0.0
+                    sale_kind = ""
             pct = max(0.0, min(100.0, pct))
+            if fixed_unit <= 0.0 or fixed_unit >= price:
+                fixed_unit = 0.0
+                if sale_kind == "price":
+                    sale_kind = ""
 
-            pct_total = whole_money_round_up(price * qty * (1.0 - pct / 100.0)) if pct > 0 else None
+            sale_total = None
+            if fixed_unit > 0.0:
+                sale_total = whole_money_round_up(fixed_unit * qty)
+                pct = ((price - fixed_unit) / price * 100.0) if price > 0 else 0.0
+            elif pct > 0.0:
+                sale_total = whole_money_round_up(price * qty * (1.0 - pct / 100.0))
             bundle_offer = bundle_map.get(bc) if (bundle_enabled and bc) else None
             bundle_total = self._bundle_offer_total(price, qty, bundle_offer) if bundle_offer else None
             regular_total = round(price * qty, 2)
@@ -4023,18 +4073,20 @@ class CashierPage(tk.Frame):
             use_bundle = (
                 bundle_total is not None
                 and bundle_total < regular_total - 0.005
-                and (pct_total is None or bundle_total <= pct_total + 0.005)
+                and (sale_total is None or bundle_total <= sale_total + 0.005)
             )
 
-            use_pct = (
-                pct_total is not None
-                and pct_total < regular_total - 0.005
+            use_sale = (
+                sale_total is not None
+                and sale_total < regular_total - 0.005
                 and not use_bundle
             )
 
-            line["sale_applied"] = bool(use_pct)
-            line["sale_pct"] = float(pct if use_pct else 0.0)
-            line["discount_pct"] = float(pct if use_pct else 0.0)
+            line["sale_applied"] = bool(use_sale)
+            line["sale_pct"] = float(pct if use_sale else 0.0)
+            line["sale_unit_price"] = float(fixed_unit if use_sale and sale_kind == "price" else 0.0)
+            line["sale_kind"] = sale_kind if use_sale else ""
+            line["discount_pct"] = float(pct if use_sale else 0.0)
 
             line["bundle_offer_applied"] = bool(use_bundle)
             if use_bundle:
@@ -13843,19 +13895,23 @@ def _seasonal_sale_manager_window(parent):
         command=toggle_enabled
     ).pack(side="left")
 
-    # Left: current sale items grouped by percent
+    # Left: current sale items with useful product and pricing details
     left = tk.Frame(content, bg=UI.CARD)
     left.grid(row=1, column=0, sticky="nsew", padx=(0, 10))
     tk.Label(left, text="Current Sale Items", font=UI.FONT_MD, bg=UI.CARD, fg=UI.TEXT).pack(anchor="w", pady=(0, 6))
 
-    sale_cols = ("barcode", "price")
-    sale_tree = ttk.Treeview(left, columns=sale_cols, show="tree headings", selectmode="extended", height=14)
-    sale_tree.heading("#0", text="Item (grouped by %)")
+    sale_cols = ("name", "old", "new", "barcode", "offer")
+    sale_tree = ttk.Treeview(left, columns=sale_cols, show="headings", selectmode="extended", height=14)
+    sale_tree.heading("name", text="Product Name")
+    sale_tree.heading("old", text="Old Price")
+    sale_tree.heading("new", text="Sale Price")
     sale_tree.heading("barcode", text="Barcode")
-    sale_tree.heading("price", text="Price")
-    sale_tree.column("#0", width=360)
+    sale_tree.heading("offer", text="Offer")
+    sale_tree.column("name", width=250, anchor="w")
+    sale_tree.column("old", width=85, anchor="e")
+    sale_tree.column("new", width=85, anchor="e")
     sale_tree.column("barcode", width=150, anchor="w")
-    sale_tree.column("price", width=90, anchor="e")
+    sale_tree.column("offer", width=90, anchor="center")
 
     sale_scroll = ttk.Scrollbar(left, orient="vertical", command=sale_tree.yview)
     sale_tree.configure(yscrollcommand=sale_scroll.set)
@@ -13869,11 +13925,14 @@ def _seasonal_sale_manager_window(parent):
 
     pct_row = tk.Frame(right, bg=UI.CARD)
     pct_row.pack(fill="x", pady=(0, 8))
-    tk.Label(pct_row, text="Discount %", bg=UI.CARD, fg=UI.TEXT).pack(side="left")
-    pct_var = tk.StringVar(value="30")
-    pct_box = ttk.Combobox(pct_row, textvariable=pct_var, values=["20", "30", "50"], width=8)
-    pct_box.pack(side="left", padx=(8, 0))
-    tk.Label(pct_row, text="(you can type custom)", bg=UI.CARD, fg=UI.MUTED).pack(side="left", padx=(8, 0))
+    tk.Label(pct_row, text="Sale method", bg=UI.CARD, fg=UI.TEXT).pack(side="left")
+    method_var = tk.StringVar(value="Fixed price")
+    method_box = ttk.Combobox(pct_row, textvariable=method_var, values=["Fixed price", "Discount %"], width=13, state="readonly")
+    method_box.pack(side="left", padx=(8, 12))
+    tk.Label(pct_row, text="Value", bg=UI.CARD, fg=UI.TEXT).pack(side="left")
+    offer_value_var = tk.StringVar(value="15")
+    ttk.Entry(pct_row, textvariable=offer_value_var, width=9).pack(side="left", padx=(8, 0))
+    tk.Label(pct_row, text="Example: $15 fixed, or 20%", bg=UI.CARD, fg=UI.MUTED).pack(side="left", padx=(8, 0))
 
     search_row = tk.Frame(right, bg=UI.CARD)
     search_row.pack(fill="x", pady=(0, 8))
@@ -13918,12 +13977,16 @@ def _seasonal_sale_manager_window(parent):
     btn_row.grid_columnconfigure(1, weight=1)
 
     # Helpers
-    def parse_pct() -> float:
+    def parse_offer_value():
         try:
-            s = str(pct_var.get() or "").strip().replace("%", "")
-            return max(0.0, min(100.0, float(s or 0.0)))
+            s = str(offer_value_var.get() or "").strip().replace("%", "").replace("$", "")
+            value = float(s or 0.0)
         except Exception:
-            return 0.0
+            value = 0.0
+        kind = "price" if method_var.get() == "Fixed price" else "percent"
+        if kind == "percent":
+            value = max(0.0, min(100.0, value))
+        return kind, value
 
     def refresh_current():
         for iid in sale_tree.get_children():
@@ -13934,33 +13997,26 @@ def _seasonal_sale_manager_window(parent):
         except Exception:
             sale_map = {}
 
-        groups = {}
-        for bc, pct in (sale_map or {}).items():
+        for bc in sorted((sale_map or {}).keys()):
+            offer = sale_map.get(bc) or {}
+            disp_name = str(bc)
+            old_price = 0.0
             try:
-                p = float(pct)
+                r = find_product_by_barcode(bc)
+                if r:
+                    disp_name = str(row_get(r, "name") or bc)
+                    old_price = float(row_get(r, "sell_price") or 0.0)
             except Exception:
-                p = 0.0
-            p = round(max(0.0, min(100.0, p)), 2)
-            if p <= 0:
-                continue
-            groups.setdefault(p, []).append(str(bc))
-
-        for pct in sorted(groups.keys(), reverse=True):
-            parent = sale_tree.insert("", tk.END, text=f"{pct:.0f}% OFF", open=True, values=("", ""))
-            for bc in sorted(groups[pct]):
-                disp_name = bc
-                disp_price = ""
-                try:
-                    r = find_product_by_barcode(bc)
-                    if r:
-                        disp_name = str(r.get("name") or bc)
-                        try:
-                            disp_price = money(float(r.get("sell_price") or 0.0))
-                        except Exception:
-                            disp_price = ""
-                except Exception:
-                    pass
-                sale_tree.insert(parent, tk.END, text=disp_name, values=(bc, disp_price))
+                pass
+            kind = str(offer.get("type") or "percent") if isinstance(offer, dict) else "percent"
+            if kind == "price":
+                new_price = float(offer.get("price") or 0.0)
+                offer_text = "Fixed price"
+            else:
+                pct = float(offer.get("pct") or 0.0) if isinstance(offer, dict) else float(offer or 0.0)
+                new_price = old_price * (1.0 - pct / 100.0)
+                offer_text = f"{pct:g}% off"
+            sale_tree.insert("", tk.END, values=(disp_name, money(old_price), money(new_price), bc, offer_text))
 
     def refresh_results():
         for iid in res_tree.get_children():
@@ -13985,9 +14041,9 @@ def _seasonal_sale_manager_window(parent):
             res_tree.insert("", tk.END, values=(bc, nm, pr))
 
     def add_selected():
-        pct = parse_pct()
-        if pct <= 0:
-            messagebox.showerror("Discount", "Enter a discount percent (e.g. 20, 30, 50).")
+        kind, value = parse_offer_value()
+        if value <= 0:
+            messagebox.showerror("Sale", "Enter a fixed sale price (for example 15) or a discount percentage.")
             return
         sels = list(res_tree.selection())
         if not sels:
@@ -13998,7 +14054,14 @@ def _seasonal_sale_manager_window(parent):
             if not bc:
                 continue
             try:
-                set_seasonal_sale_item(bc, pct)
+                if kind == "price":
+                    old_price = float(str(vals[2] if len(vals) > 2 else "0").replace("$", "").replace(",", "") or 0.0)
+                    if old_price > 0 and value >= old_price:
+                        messagebox.showerror("Sale", f"Sale price must be below the old price for barcode {bc}.", parent=win)
+                        continue
+                    set_seasonal_sale_price_item(bc, value)
+                else:
+                    set_seasonal_sale_item(bc, value)
             except Exception:
                 pass
         refresh_current()
@@ -14008,52 +14071,14 @@ def _seasonal_sale_manager_window(parent):
         if not sels:
             return
         for iid in sels:
-            parent = sale_tree.parent(iid)
-            # if a group header is selected, skip (use remove_groups)
-            if parent == "":
-                continue
             vals = sale_tree.item(iid, "values") or ()
-            bc = str(vals[0] if len(vals) > 0 else "").strip()
+            bc = str(vals[3] if len(vals) > 3 else "").strip()
             if not bc:
                 continue
             try:
                 remove_seasonal_sale_item(bc)
             except Exception:
                 pass
-        refresh_current()
-
-    def remove_groups():
-        sels = list(sale_tree.selection())
-        if not sels:
-            return
-
-        group_iids = []
-        for iid in sels:
-            gid = iid if sale_tree.parent(iid) == "" else sale_tree.parent(iid)
-            if gid and gid not in group_iids:
-                group_iids.append(gid)
-
-        try:
-            sale_map = get_seasonal_sales_map()
-        except Exception:
-            sale_map = {}
-
-        for gid in group_iids:
-            text = str(sale_tree.item(gid, "text") or "")
-            pct = 0.0
-            try:
-                pct = float(text.split("%")[0].strip())
-            except Exception:
-                pct = 0.0
-            if pct <= 0:
-                continue
-            for bc, p in list((sale_map or {}).items()):
-                try:
-                    if abs(float(p) - pct) < 0.01:
-                        remove_seasonal_sale_item(bc)
-                except Exception:
-                    continue
-
         refresh_current()
 
     def clear_all():
@@ -14079,10 +14104,8 @@ def _seasonal_sale_manager_window(parent):
         res_tree.selection_remove(*res_tree.selection())
 
     def select_all_sale_items():
-        # select all child rows (items), not group headers
-        for gid in sale_tree.get_children():
-            for iid in sale_tree.get_children(gid):
-                sale_tree.selection_add(iid)
+        for iid in sale_tree.get_children():
+            sale_tree.selection_add(iid)
 
     # Bind search
     def _do_search():
@@ -14095,7 +14118,6 @@ def _seasonal_sale_manager_window(parent):
     left_btns.grid(row=0, column=0, sticky="w")
     GhostButton(left_btns, "Select ALL sale items", select_all_sale_items).pack(side="left", padx=(0, 8))
     PrimaryButton(left_btns, "Remove Selected Items", remove_selected_items).pack(side="left", padx=(0, 8))
-    GhostButton(left_btns, "Remove Selected % Group(s)", remove_groups).pack(side="left", padx=(0, 8))
     DangerButton(left_btns, "Clear ALL", clear_all).pack(side="left")
 
     # Right-side actions
@@ -14159,18 +14181,20 @@ def _bundle_offer_manager_window(parent):
     left.grid(row=1, column=0, sticky="nsew", padx=(0, 10))
     tk.Label(left, text="Current Bundle Offers", font=UI.FONT_MD, bg=UI.CARD, fg=UI.TEXT).pack(anchor="w", pady=(0, 6))
 
-    offer_cols = ("barcode", "qty", "offer", "unit")
+    offer_cols = ("old", "new", "barcode", "qty", "bundle")
     offer_tree = ttk.Treeview(left, columns=offer_cols, show="tree headings", selectmode="extended", height=14)
-    offer_tree.heading("#0", text="Item")
+    offer_tree.heading("#0", text="Product Name")
+    offer_tree.heading("old", text="Old Price")
+    offer_tree.heading("new", text="New / Unit")
     offer_tree.heading("barcode", text="Barcode")
     offer_tree.heading("qty", text="Qty")
-    offer_tree.heading("offer", text="Offer Price")
-    offer_tree.heading("unit", text="Unit Price")
-    offer_tree.column("#0", width=300, anchor="w")
+    offer_tree.heading("bundle", text="Bundle Price")
+    offer_tree.column("#0", width=230, anchor="w")
+    offer_tree.column("old", width=85, anchor="e")
+    offer_tree.column("new", width=90, anchor="e")
     offer_tree.column("barcode", width=140, anchor="w")
     offer_tree.column("qty", width=60, anchor="center")
-    offer_tree.column("offer", width=90, anchor="e")
-    offer_tree.column("unit", width=90, anchor="e")
+    offer_tree.column("bundle", width=95, anchor="e")
 
     offer_scroll = ttk.Scrollbar(left, orient="vertical", command=offer_tree.yview)
     offer_tree.configure(yscrollcommand=offer_scroll.set)
@@ -14240,20 +14264,24 @@ def _bundle_offer_manager_window(parent):
         for bc in sorted((offer_map or {}).keys()):
             offer = offer_map.get(bc) or {}
             disp_name = bc
-            disp_unit = ""
+            old_unit = 0.0
             try:
                 r = find_product_by_barcode(bc)
                 if r:
-                    disp_name = str(r.get("name") or bc)
-                    disp_unit = money(float(r.get("sell_price") or 0.0))
+                    disp_name = str(row_get(r, "name") or bc)
+                    old_unit = float(row_get(r, "sell_price") or 0.0)
             except Exception:
                 pass
             try:
+                offer_qty = int(offer.get("qty") or 0)
+                offer_price = float(offer.get("price") or 0.0)
+                new_unit = offer_price / offer_qty if offer_qty > 0 else 0.0
                 offer_tree.insert("", tk.END, text=disp_name, values=(
+                    money(old_unit),
+                    money(new_unit),
                     bc,
-                    int(offer.get("qty") or 0),
-                    money(float(offer.get("price") or 0.0)),
-                    disp_unit,
+                    offer_qty,
+                    money(offer_price),
                 ))
             except Exception:
                 pass
@@ -14301,7 +14329,7 @@ def _bundle_offer_manager_window(parent):
             return
         for iid in sels:
             vals = res_tree.item(iid, "values") or ()
-            bc = str(vals[0] if len(vals) > 0 else "").strip()
+            bc = str(vals[2] if len(vals) > 2 else "").strip()
             if not bc:
                 continue
             try:

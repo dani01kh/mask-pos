@@ -14,7 +14,7 @@ from pathlib import Path
 import requests
 
 
-APP_VERSION = "3.15.1"
+APP_VERSION = "3.15.4"
 GITHUB_REPO = "dani01kh/mask-pos"
 LATEST_RELEASE_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 INSTALLER_SCRIPT_NAME = "install_maskpos_update.ps1"
@@ -77,18 +77,11 @@ def check_for_update(timeout: int = 10) -> dict:
         timeout=timeout,
     )
     if response.status_code == 404:
-        return {
-            "available": False,
-            "current_version": APP_VERSION,
-            "version": APP_VERSION,
-            "tag_name": "",
-            "release_name": "",
-            "notes": "No releases found on GitHub.",
-            "asset_name": "",
-            "asset_sha256": "",
-            "download_url": "",
-            "html_url": "",
-        }
+        raise RuntimeError(
+            "The Mask POS GitHub release repository is not publicly reachable, "
+            "or it does not exist. Make the repository public and publish a non-draft "
+            "release with a MaskPOS ZIP asset."
+        )
     response.raise_for_status()
     release = response.json() or {}
     tag = str(release.get("tag_name") or release.get("name") or "").strip()

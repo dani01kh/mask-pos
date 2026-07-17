@@ -990,7 +990,11 @@ def set_seasonal_sale_enabled(enabled: bool) -> None:
 
 
 def get_seasonal_sales_map() -> dict:
-    """Return {barcode: sale_pct} mapping (pct 0-100)."""
+    """Return normalized seasonal offers keyed by barcode.
+
+    Legacy numeric values remain supported as percentage discounts. New values
+    may be {"type": "price", "price": 15.0} for a fixed unit sale price.
+    """
     if _MODE == "connect":
         try:
             raw = _remote_get("/config/offers").get("seasonal_sales_map") or {}
@@ -1006,14 +1010,28 @@ def get_seasonal_sales_map() -> dict:
         bc = str(k or "").strip()
         if not bc:
             continue
-        try:
-            pct = float(v)
-        except Exception:
-            continue
+        if isinstance(v, dict):
+            kind = str(v.get("type") or "").strip().lower()
+            if kind == "price" or "price" in v or "sale_price" in v:
+                try:
+                    price = float(v.get("price", v.get("sale_price", 0.0)) or 0.0)
+                except Exception:
+                    price = 0.0
+                if price > 0.0:
+                    out[bc] = {"type": "price", "price": round(price, 2)}
+                continue
+            try:
+                pct = float(v.get("pct", v.get("percent", v.get("value", 0.0))) or 0.0)
+            except Exception:
+                pct = 0.0
+        else:
+            try:
+                pct = float(v)
+            except Exception:
+                continue
         pct = max(0.0, min(100.0, pct))
-        if pct <= 0.0:
-            continue
-        out[bc] = round(pct, 2)
+        if pct > 0.0:
+            out[bc] = {"type": "percent", "pct": round(pct, 2)}
     return out
 
 
@@ -1033,7 +1051,7 @@ def set_seasonal_sale_item(barcode: str, sale_pct: float) -> None:
         if pct <= 0.0:
             m.pop(bc, None)
         else:
-            m[bc] = round(pct, 2)
+            m[bc] = {"type": "percent", "pct": round(pct, 2)}
         _remote_post("/config/offers", {"seasonal_sales_map": m})
         return
 
@@ -1048,8 +1066,40 @@ def set_seasonal_sale_item(barcode: str, sale_pct: float) -> None:
         except Exception:
             pass
     else:
-        m[bc] = round(pct, 2)
+        m[bc] = {"type": "percent", "pct": round(pct, 2)}
 
+    cfg["seasonal_sales_map"] = m
+    _save_config(cfg)
+    _cloud_enqueue_config(_offers_config_payload())
+
+
+def set_seasonal_sale_price_item(barcode: str, sale_price: float) -> None:
+    """Add/update a barcode with a fixed unit sale price."""
+    bc = str(barcode or "").strip()
+    if not bc:
+        return
+    try:
+        price = round(max(0.0, float(sale_price)), 2)
+    except Exception:
+        price = 0.0
+
+    if _MODE == "connect":
+        m = get_seasonal_sales_map()
+        if price <= 0.0:
+            m.pop(bc, None)
+        else:
+            m[bc] = {"type": "price", "price": price}
+        _remote_post("/config/offers", {"seasonal_sales_map": m})
+        return
+
+    cfg = _load_config()
+    m = cfg.get("seasonal_sales_map") or {}
+    if not isinstance(m, dict):
+        m = {}
+    if price <= 0.0:
+        m.pop(bc, None)
+    else:
+        m[bc] = {"type": "price", "price": price}
     cfg["seasonal_sales_map"] = m
     _save_config(cfg)
     _cloud_enqueue_config(_offers_config_payload())

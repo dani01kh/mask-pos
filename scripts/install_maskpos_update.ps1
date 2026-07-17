@@ -45,7 +45,7 @@ try {
     $state | ConvertTo-Json | Set-Content -Path $ResultPath -Encoding UTF8 -Force
     Write-Log "Wrote ready status to $ResultPath"
 } catch {
-    Write-Log "Failed to write initial state to $ResultPath: $_"
+    Write-Log "Failed to write initial state to ${ResultPath}: $_"
 }
 
 # 2. Wait for parent process to exit
