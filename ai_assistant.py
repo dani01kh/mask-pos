@@ -15,7 +15,7 @@ import requests
 
 
 GEMINI_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-ALLOWED_MODELS = {"gemini-2.5-flash", "gemini-2.5-flash-lite"}
+ALLOWED_MODELS = {"gemini-3.5-flash", "gemini-3.1-flash-lite"}
 
 ACTION_DECLARATIONS = [
     {"name": "create_product", "description": "Create a new Mask POS product.", "parameters": {"type": "OBJECT", "properties": {
@@ -175,7 +175,7 @@ def ask_gemini(*, api_key: str, model: str, question: str, context: str, timeout
     api_key = str(api_key or "").strip()
     if not api_key:
         raise ValueError("Add your free Gemini API key first.")
-    model = str(model or "gemini-2.5-flash").strip()
+    model = str(model or "gemini-3.1-flash-lite").strip()
     if model not in ALLOWED_MODELS:
         raise ValueError("Only approved Gemini free-tier models are allowed.")
     prompt = (
@@ -200,7 +200,12 @@ def ask_gemini(*, api_key: str, model: str, question: str, context: str, timeout
         raise RuntimeError("Free Gemini quota reached. Try again after Google's quota resets. No charge was made.")
     if response.status_code in (401, 403):
         raise RuntimeError("Gemini rejected this API key. Check that it belongs to a free-tier project with billing disabled.")
-    response.raise_for_status()
+    if response.status_code >= 400:
+        try:
+            detail = str((response.json().get("error") or {}).get("message") or "").strip()
+        except Exception:
+            detail = ""
+        raise RuntimeError(detail or f"Gemini request failed (HTTP {response.status_code}).")
     data = response.json() or {}
     try:
         parts = data["candidates"][0]["content"]["parts"]
@@ -215,7 +220,7 @@ def ask_gemini(*, api_key: str, model: str, question: str, context: str, timeout
                 raise RuntimeError("Gemini requested an action that Mask POS does not allow.")
             return {"answer": text.strip() or "I prepared this action for your confirmation.",
                     "action": {"name": name, "args": dict(call.get("args") or {})}}
-    if not text.strip():
+    if not text.strip() or text.strip().lower() in {"none", "null"}:
         raise RuntimeError("Gemini returned an empty answer.")
     return {"answer": text.strip(), "action": None}
 

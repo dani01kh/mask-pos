@@ -450,17 +450,17 @@ def get_ai_assistant_config() -> dict:
     return {
         "enabled": bool(cfg.get("ai_assistant_enabled", False)),
         "provider": "gemini_free",
-        "model": str(cfg.get("gemini_model") or "gemini-2.5-flash").strip(),
+        "model": str(cfg.get("gemini_model") or "gemini-3.1-flash-lite").strip(),
         "api_key": str(cfg.get("gemini_api_key") or "").strip(),
     }
 
 
-def set_ai_assistant_config(*, enabled: bool, api_key: str, model: str = "gemini-2.5-flash") -> None:
+def set_ai_assistant_config(*, enabled: bool, api_key: str, model: str = "gemini-3.1-flash-lite") -> None:
     """Save Gemini settings only in the protected local pos_config.json file."""
     cfg = _load_config()
     cfg["ai_assistant_enabled"] = bool(enabled)
     cfg["gemini_api_key"] = str(api_key or "").strip()
-    cfg["gemini_model"] = str(model or "gemini-2.5-flash").strip()
+    cfg["gemini_model"] = str(model or "gemini-3.1-flash-lite").strip()
     _save_config(cfg)
 
 

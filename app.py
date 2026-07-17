@@ -7055,12 +7055,15 @@ class AIAssistantPage(tk.Frame):
         setup.pack(fill="x", pady=(12, 0))
         cfg = get_ai_assistant_config()
         self.key_var = tk.StringVar(value=str(cfg.get("api_key") or ""))
-        self.model_var = tk.StringVar(value=str(cfg.get("model") or "gemini-2.5-flash"))
+        saved_model = str(cfg.get("model") or "gemini-3.1-flash-lite")
+        if saved_model not in {"gemini-3.5-flash", "gemini-3.1-flash-lite"}:
+            saved_model = "gemini-3.1-flash-lite"
+        self.model_var = tk.StringVar(value=saved_model)
         self.status_var = tk.StringVar(value=("Ready" if self.key_var.get() else "Add a free-tier Gemini API key to begin."))
         tk.Label(setup.inner, text="Free Gemini API key", font=UI.FONT_MD, bg=UI.CARD, fg=UI.TEXT).grid(row=0, column=0, sticky="w")
         ttk.Entry(setup.inner, textvariable=self.key_var, show="*", width=52).grid(row=1, column=0, sticky="ew", pady=(5, 0))
         ttk.Combobox(setup.inner, textvariable=self.model_var, state="readonly", width=24,
-                     values=("gemini-2.5-flash", "gemini-2.5-flash-lite")).grid(row=1, column=1, padx=(10, 0), pady=(5, 0))
+                     values=("gemini-3.5-flash", "gemini-3.1-flash-lite")).grid(row=1, column=1, padx=(10, 0), pady=(5, 0))
         ttk.Button(setup.inner, text="Save Free Key", command=self._save_settings).grid(row=1, column=2, padx=(10, 0), pady=(5, 0))
         setup.inner.grid_columnconfigure(0, weight=1)
         tk.Label(setup.inner,
@@ -7087,7 +7090,7 @@ class AIAssistantPage(tk.Frame):
         tk.Label(outer, textvariable=self.status_var, font=UI.FONT_SM, bg=UI.CONTENT_BG, fg=UI.MUTED).pack(anchor="w", pady=(6, 0))
 
     def _save_settings(self, show_message=True):
-        key = self.key_var.get().strip(); model = self.model_var.get().strip() or "gemini-2.5-flash"
+        key = self.key_var.get().strip(); model = self.model_var.get().strip() or "gemini-3.1-flash-lite"
         set_ai_assistant_config(enabled=bool(key), api_key=key, model=model)
         self.status_var.set("Free-tier Gemini settings saved locally." if key else "AI assistant disabled; no key saved.")
         if show_message: messagebox.showinfo("AI Assistant", self.status_var.get())
