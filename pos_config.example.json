@@ -27,5 +27,8 @@
   "daily_report_smtp_server": "smtp.gmail.com",
   "daily_report_smtp_port": 587,
   "daily_report_smtp_use_tls": true,
-  "daily_report_send_time": "05:17"
+  "daily_report_send_time": "05:17",
+  "ai_assistant_enabled": false,
+  "gemini_model": "gemini-2.5-flash",
+  "gemini_api_key": ""
 }

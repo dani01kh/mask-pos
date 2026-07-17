@@ -444,6 +444,26 @@ def _save_config(cfg: dict) -> None:
         raise
 
 
+def get_ai_assistant_config() -> dict:
+    """Return local Gemini assistant settings without exposing them to cloud sync."""
+    cfg = _load_config()
+    return {
+        "enabled": bool(cfg.get("ai_assistant_enabled", False)),
+        "provider": "gemini_free",
+        "model": str(cfg.get("gemini_model") or "gemini-2.5-flash").strip(),
+        "api_key": str(cfg.get("gemini_api_key") or "").strip(),
+    }
+
+
+def set_ai_assistant_config(*, enabled: bool, api_key: str, model: str = "gemini-2.5-flash") -> None:
+    """Save Gemini settings only in the protected local pos_config.json file."""
+    cfg = _load_config()
+    cfg["ai_assistant_enabled"] = bool(enabled)
+    cfg["gemini_api_key"] = str(api_key or "").strip()
+    cfg["gemini_model"] = str(model or "gemini-2.5-flash").strip()
+    _save_config(cfg)
+
+
 DEFAULT_DAILY_REPORT_RECIPIENTS = [
     "dani123khoueiry@gmail.com",
     "assaadmask@gmail.com",

@@ -366,7 +366,11 @@ from backend import (
     bulk_update_products,
     repair_broken_product_links,
     recreate_and_repair_product,
+    get_ai_assistant_config,
+    set_ai_assistant_config,
 )
+
+from ai_assistant import ask_gemini, build_business_context, execute_approved_action, describe_action
 
 try:
     from receipt_pdf import create_temp_receipt_pdf, create_gift_receipt_pdf, create_weekly_selection_receipt_pdf
@@ -1406,6 +1410,7 @@ class MaskPOS(tk.Tk):
         self.returns_page = None
         self.offers_page = None
         self.settings_page = None
+        self.ai_assistant_page = None
 
         # Hotkey: Ctrl+P to reprint receipt from anywhere
         try:
@@ -1424,6 +1429,7 @@ class MaskPOS(tk.Tk):
             "ReturnsPage": lambda: ReturnsPage(self.content_scroll_inner, cashier_page=self.cashier_page),
             "OffersPage": lambda: OffersPage(self.content_scroll_inner),
             "SettingsPage": lambda: SettingsPage(self.content_scroll_inner),
+            "AIAssistantPage": lambda: AIAssistantPage(self.content_scroll_inner),
             "DataHealthPage": lambda: DataHealthPage(self.content_scroll_inner),
         }
         self._page_attrs = {
@@ -1435,6 +1441,7 @@ class MaskPOS(tk.Tk):
             "ReturnsPage": "returns_page",
             "OffersPage": "offers_page",
             "SettingsPage": "settings_page",
+            "AIAssistantPage": "ai_assistant_page",
             "DataHealthPage": "data_health_page",
         }
 
@@ -1498,6 +1505,7 @@ class MaskPOS(tk.Tk):
             ("🏷", "Barcodes", "BarcodesPage"),
             ("🩺", "Data Health", "DataHealthPage"),
             ("📈", "Analytics", "AnalyticsPage"),
+            ("AI", "AI Assistant", "AIAssistantPage"),
             ("⚙️", "Settings", "SettingsPage"),
         ]
 
@@ -7026,6 +7034,110 @@ class BarcodesPage(tk.Frame):
         tree.pack(side="left", fill="both", expand=True)
         vsb.pack(side="right", fill="y")
         load_history()
+
+
+# ---------------- AI ASSISTANT PAGE ----------------
+
+class AIAssistantPage(tk.Frame):
+    def __init__(self, parent):
+        super().__init__(parent, bg=UI.CONTENT_BG)
+        self._busy = False
+        self._build()
+
+    def _build(self):
+        outer = tk.Frame(self, bg=UI.CONTENT_BG)
+        outer.pack(fill="both", expand=True, padx=18, pady=18)
+        header = Card(outer, padx=18, pady=18)
+        header.pack(fill="x")
+        HeaderBar(header.inner, "AI Assistant", "Free-tier Gemini with confirmation before every action.").pack(fill="x")
+
+        setup = Card(outer, padx=18, pady=14)
+        setup.pack(fill="x", pady=(12, 0))
+        cfg = get_ai_assistant_config()
+        self.key_var = tk.StringVar(value=str(cfg.get("api_key") or ""))
+        self.model_var = tk.StringVar(value=str(cfg.get("model") or "gemini-2.5-flash"))
+        self.status_var = tk.StringVar(value=("Ready" if self.key_var.get() else "Add a free-tier Gemini API key to begin."))
+        tk.Label(setup.inner, text="Free Gemini API key", font=UI.FONT_MD, bg=UI.CARD, fg=UI.TEXT).grid(row=0, column=0, sticky="w")
+        ttk.Entry(setup.inner, textvariable=self.key_var, show="*", width=52).grid(row=1, column=0, sticky="ew", pady=(5, 0))
+        ttk.Combobox(setup.inner, textvariable=self.model_var, state="readonly", width=24,
+                     values=("gemini-2.5-flash", "gemini-2.5-flash-lite")).grid(row=1, column=1, padx=(10, 0), pady=(5, 0))
+        ttk.Button(setup.inner, text="Save Free Key", command=self._save_settings).grid(row=1, column=2, padx=(10, 0), pady=(5, 0))
+        setup.inner.grid_columnconfigure(0, weight=1)
+        tk.Label(setup.inner,
+                 text="Use a Google AI Studio project with billing disabled. No paid fallback is configured. When free quota ends, AI stops. Every write and print requires confirmation.",
+                 font=UI.FONT_SM, bg=UI.CARD, fg=UI.MUTED, wraplength=900, justify="left").grid(row=2, column=0, columnspan=3, sticky="w", pady=(8, 0))
+
+        chat_card = Card(outer, padx=14, pady=14)
+        chat_card.pack(fill="both", expand=True, pady=(12, 0))
+        self.chat = tk.Text(chat_card.inner, wrap="word", state="disabled", bg=UI.SURFACE, fg=UI.TEXT,
+                            relief="flat", bd=0, font=UI.FONT, padx=12, pady=12)
+        scroll = ttk.Scrollbar(chat_card.inner, orient="vertical", command=self.chat.yview)
+        self.chat.configure(yscrollcommand=scroll.set)
+        self.chat.pack(side="left", fill="both", expand=True); scroll.pack(side="right", fill="y")
+        self._append("Mask POS AI", "Ask about the business or request product, stock, offer, label, and warehouse actions. Nothing changes until you confirm.")
+
+        ask_card = Card(outer, padx=14, pady=12)
+        ask_card.pack(fill="x", pady=(12, 0))
+        self.question = tk.Text(ask_card.inner, height=3, wrap="word", font=UI.FONT, relief="solid", bd=1)
+        self.question.pack(side="left", fill="x", expand=True)
+        self.question.bind("<Control-Return>", lambda _event: self._ask())
+        buttons = tk.Frame(ask_card.inner, bg=UI.CARD); buttons.pack(side="left", padx=(10, 0))
+        self.ask_button = PrimaryButton(buttons, "Ask Gemini", self._ask); self.ask_button.pack(fill="x")
+        GhostButton(buttons, "Clear Chat", self._clear_chat).pack(fill="x", pady=(7, 0))
+        tk.Label(outer, textvariable=self.status_var, font=UI.FONT_SM, bg=UI.CONTENT_BG, fg=UI.MUTED).pack(anchor="w", pady=(6, 0))
+
+    def _save_settings(self, show_message=True):
+        key = self.key_var.get().strip(); model = self.model_var.get().strip() or "gemini-2.5-flash"
+        set_ai_assistant_config(enabled=bool(key), api_key=key, model=model)
+        self.status_var.set("Free-tier Gemini settings saved locally." if key else "AI assistant disabled; no key saved.")
+        if show_message: messagebox.showinfo("AI Assistant", self.status_var.get())
+        return bool(key)
+
+    def _append(self, speaker, text):
+        self.chat.configure(state="normal")
+        if self.chat.index("end-1c") != "1.0": self.chat.insert("end", "\n\n")
+        self.chat.insert("end", f"{speaker}\n", ("speaker",)); self.chat.insert("end", str(text or ""))
+        self.chat.tag_configure("speaker", font=("Segoe UI", 10, "bold"), foreground=UI.PRIMARY)
+        self.chat.configure(state="disabled"); self.chat.see("end")
+
+    def _clear_chat(self):
+        self.chat.configure(state="normal"); self.chat.delete("1.0", "end"); self.chat.configure(state="disabled")
+        self._append("Mask POS AI", "Chat cleared. POS data was not changed.")
+
+    def _ask(self):
+        if self._busy: return
+        question = self.question.get("1.0", "end").strip()
+        if not question: messagebox.showinfo("AI Assistant", "Type a question first."); return
+        if not self.key_var.get().strip():
+            messagebox.showwarning("AI Assistant", "Paste a free-tier Gemini API key and save it first."); return
+        self._save_settings(show_message=False); self.question.delete("1.0", "end"); self._append("You", question)
+        self._busy = True; self.ask_button.configure(state="disabled")
+        self.status_var.set("Preparing a local summary and asking Gemini...")
+        def worker():
+            try:
+                result = ask_gemini(api_key=self.key_var.get().strip(), model=self.model_var.get().strip(),
+                                    question=question, context=build_business_context(data_path("pos.db"), question))
+                self.after(0, lambda: self._finish(result, None))
+            except Exception as exc:
+                self.after(0, lambda: self._finish(None, str(exc)))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _finish(self, result, error):
+        self._busy = False; self.ask_button.configure(state="normal")
+        if error:
+            self.status_var.set(error); self._append("Mask POS AI", error); return
+        self._append("Mask POS AI", result.get("answer") or "")
+        action = result.get("action")
+        if not action:
+            self.status_var.set("Answer received. No POS data was changed."); return
+        details = describe_action(action)
+        if not messagebox.askyesno("Confirm AI action", f"Gemini proposes this action:\n\n{details}\n\nExecute it now?", parent=self.winfo_toplevel()):
+            self.status_var.set("Action cancelled. Nothing was changed."); self._append("Mask POS", "Action cancelled."); return
+        try:
+            message = execute_approved_action(action)
+            self.status_var.set(message); self._append("Mask POS", message)
+        except Exception as exc:
+            self.status_var.set(str(exc)); self._append("Mask POS", f"Action failed: {exc}")
 
 
 # ---------------- ANALYTICS PAGE ----------------
