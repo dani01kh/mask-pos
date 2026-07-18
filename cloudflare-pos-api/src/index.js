@@ -358,6 +358,29 @@ async function applySale(db, event, payload) {
     await deleteSale(db, event, payload);
     return;
   }
+  if (event.event_type === "update_payment") {
+    const localId = text(event.entity_id || payload.sale_id);
+    const snapshot = payload.sale && typeof payload.sale === "object" ? payload.sale : {};
+    let sale = await db.prepare(
+      "SELECT id FROM sales WHERE cloud_device_id = ? AND cloud_local_id = ? LIMIT 1"
+    ).bind(event.device_id, localId).first();
+    if (!sale && snapshot.receipt_date && snapshot.receipt_code) {
+      sale = await db.prepare(
+        "SELECT id FROM sales WHERE receipt_date = ? AND receipt_code = ? LIMIT 1"
+      ).bind(text(snapshot.receipt_date), text(snapshot.receipt_code)).first();
+    }
+    if (sale) {
+      await db.prepare(
+        "UPDATE sales SET payment_method = ?, cash_paid = ?, notes = ? WHERE id = ?"
+      ).bind(
+        text(snapshot.payment_method || payload.payment_method, "CASH").toUpperCase(),
+        num(snapshot.cash_paid),
+        text(snapshot.notes),
+        sale.id,
+      ).run();
+    }
+    return;
+  }
   if (event.event_type === "void") {
     const localId = text(event.entity_id || payload.sale_id);
     const sale = await db.prepare(

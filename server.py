@@ -157,6 +157,20 @@ class SaleVoidIn(BaseModel):
     voided_by: str = ""
     restore_stock: bool = True
 
+class SalePaymentUpdateIn(BaseModel):
+    sale_id: int
+    payment_method: str = ""
+    cash_amount: float | None = None
+    whish_amount: float | None = None
+    card_amount: float | None = None
+    reason: str
+    changed_by: str = ""
+
+class CashMovementReverseIn(BaseModel):
+    movement_id: int
+    reason: str
+    changed_by: str = ""
+
 class ReturnCreateIn(BaseModel):
     original_sale_id: int
     returned_lines: List[dict]
@@ -613,6 +627,42 @@ def api_void_sale(d: SaleVoidIn):
     return {"ok": bool(ok)}
 
 
+@app.post("/sales/update_payment")
+def api_update_sale_payment(d: SalePaymentUpdateIn):
+    try:
+        if d.cash_amount is not None or d.whish_amount is not None or d.card_amount is not None:
+            result = L.update_sale_payment_split(
+                d.sale_id,
+                d.cash_amount or 0.0,
+                d.whish_amount or 0.0,
+                d.card_amount or 0.0,
+                d.reason,
+                d.changed_by,
+            )
+        else:
+            result = L.update_sale_payment_method(
+                d.sale_id,
+                d.payment_method,
+                d.reason,
+                d.changed_by,
+            )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    sale, _items = L.get_sale_detail(d.sale_id)
+    _cloud_enqueue("update_payment", "sale", d.sale_id, {
+        "sale_id": int(d.sale_id),
+        "payment_method": str((result or {}).get("new_payment_method") or d.payment_method or "").strip().upper(),
+        "cash_amount": d.cash_amount,
+        "whish_amount": d.whish_amount,
+        "card_amount": d.card_amount,
+        "reason": str(d.reason or ""),
+        "changed_by": str(d.changed_by or ""),
+        "sale": dict(sale) if sale else None,
+        "result": dict(result or {}),
+    })
+    return {"ok": True, "result": result}
+
+
 # ---------------- Returns ----------------
 
 @app.post("/returns/create")
@@ -920,6 +970,21 @@ def api_list_cash_movements(shift_id: int | None = None, day_str: str = "", limi
     return {"items": _as_list(rows)}
 
 
+@app.post("/cash_movements/reverse")
+def api_reverse_cash_movement(d: CashMovementReverseIn):
+    try:
+        result = L.reverse_cash_movement(d.movement_id, d.reason, d.changed_by)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    reversal_id = int((result or {}).get("reversal_movement_id") or 0)
+    snapshot = _cash_movement_snapshot(reversal_id)
+    if snapshot:
+        snapshot["movement_id"] = reversal_id
+        snapshot["reversal_result"] = dict(result or {})
+        _cloud_enqueue("create", "cash_movement", reversal_id, snapshot)
+    return {"ok": True, "result": result}
+
+
 # ---------------- Diagnostics ----------------
 
 @app.get("/debug/db_test")
@@ -1022,7 +1087,7 @@ def api_send_daily_report_email(p: SendDailyReportEmailIn):
             f"Cash collected: {_money(summary.get('cash_collected', 0.0))}\n"
             f"Returns / refunds: {_money(summary.get('returns', 0.0))} total, {_money(summary.get('cash_refunds', 0.0))} cash\n"
             f"Drawer movement: +{_money(summary.get('cash_added', 0.0))} in, -{_money(summary.get('cash_removed', 0.0))} out\n"
-            f"Drawer net cash change: {_money(drawer_net)}\n"
+            f"Cash movement after sales, refunds, cash in/out (not variance): {_money(drawer_net)}\n"
             f"Orders: {int(summary.get('orders', 0) or 0)}\n\n"
             "Attached: Excel details + PDF with sales list and drawer summary."
         )

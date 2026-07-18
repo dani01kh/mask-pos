@@ -3933,6 +3933,267 @@ def void_sale(sale_id, reason="", voided_by="", restore_stock=True):
     finally:
         conn.close()
 
+
+def _clean_audit_text(value, default=""):
+    text = " ".join(str(value or "").replace("|", " ").split()).strip()
+    return text or default
+
+
+def _sale_payment_method_from_tenders(cash_amount, whish_amount, card_amount):
+    active = []
+    if round(float(cash_amount or 0.0), 2) > 0:
+        active.append("CASH")
+    if round(float(whish_amount or 0.0), 2) > 0:
+        active.append("WHISH")
+    if round(float(card_amount or 0.0), 2) > 0:
+        active.append("CARD")
+    return "+".join(active) if active else "CASH"
+
+
+def _adjust_shift_recorded_variance_cur(cur, shift_id, cash_delta, reason_note):
+    shift_variance_before = None
+    shift_variance_after = None
+    if int(shift_id or 0) <= 0:
+        return shift_variance_before, shift_variance_after
+    shift = cur.execute(
+        "SELECT id, closed_at, notes FROM cash_shifts WHERE id = ? LIMIT 1",
+        (int(shift_id),),
+    ).fetchone()
+    if not shift or not shift["closed_at"]:
+        return shift_variance_before, shift_variance_after
+    shift_notes = str(shift["notes"] or "")
+    matches = list(re.finditer(r"(?i)(variance\s+\$?)(-?[0-9]+(?:\.[0-9]+)?)", shift_notes))
+    if not matches:
+        return shift_variance_before, shift_variance_after
+    match = matches[-1]
+    shift_variance_before = float(match.group(2))
+    shift_variance_after = round(shift_variance_before - float(cash_delta or 0.0), 2)
+    shown = f"{shift_variance_after:.2f}".rstrip("0").rstrip(".")
+    shift_notes = shift_notes[:match.start(2)] + shown + shift_notes[match.end(2):]
+    if reason_note:
+        shift_notes += "\n" + str(reason_note).strip()
+    cur.execute("UPDATE cash_shifts SET notes = ? WHERE id = ?", (shift_notes, int(shift_id)))
+    return shift_variance_before, shift_variance_after
+
+
+def update_sale_payment_split(sale_id, cash_amount=0.0, whish_amount=0.0, card_amount=0.0, reason="", changed_by=""):
+    """Correct a sale's tender split without changing items, total, stock, or receipt total."""
+    clean_reason = " ".join(str(reason or "").replace("|", " ").split()).strip()
+    if not clean_reason:
+        raise ValueError("A reason is required for a payment correction.")
+    actor = " ".join(str(changed_by or "").replace("|", " ").split()).strip() or "Manager"
+    try:
+        new_cash = round(max(0.0, float(cash_amount or 0.0)), 2)
+        new_whish = round(max(0.0, float(whish_amount or 0.0)), 2)
+        new_card = round(max(0.0, float(card_amount or 0.0)), 2)
+    except Exception as exc:
+        raise ValueError("Payment amounts must be numbers.") from exc
+
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        sale = cur.execute("SELECT * FROM sales WHERE id = ? LIMIT 1", (int(sale_id),)).fetchone()
+        if not sale:
+            raise ValueError("Sale not found.")
+        if int(sale["is_voided"] or 0):
+            raise ValueError("A voided sale's payment method cannot be changed.")
+
+        old_method = str(sale["payment_method"] or "CASH").strip().upper()
+        if old_method in ("EXCHANGE", "STORE_CREDIT"):
+            raise ValueError("Store-credit and exchange sales cannot be changed with this tool.")
+
+        old_cash = float(sale["cash_paid"] or 0.0)
+        total_sales = float(sale["total_sales"] or sale["total_amount"] or 0.0)
+        store_credit = float(sale["store_credit_used"] or 0.0)
+        amount_due = max(0.0, total_sales - store_credit)
+        old_whish = 0.0
+        old_card = 0.0
+        old_notes = str(sale["notes"] or "")
+        for part in old_notes.replace(";", "|").split("|"):
+            token = part.strip()
+            upper = token.upper()
+            try:
+                if upper.startswith("PAYMENT_WHISH="):
+                    old_whish = round(max(0.0, float(token.split("=", 1)[1] or 0.0)), 2)
+                elif upper.startswith("PAYMENT_CARD="):
+                    old_card = round(max(0.0, float(token.split("=", 1)[1] or 0.0)), 2)
+            except Exception:
+                pass
+        if old_method == "WHISH" and old_whish <= 0:
+            old_whish = round(amount_due, 2)
+        elif old_method in ("CARD", "CREDIT_CARD", "DEBIT") and old_card <= 0:
+            old_card = round(amount_due, 2)
+        tender_total = round(new_cash + new_whish + new_card, 2)
+        if abs(tender_total - round(amount_due, 2)) > 0.01:
+            raise ValueError(f"Tender split must total ${amount_due:.2f}.")
+        new_method = _sale_payment_method_from_tenders(new_cash, new_whish, new_card)
+        if old_method == new_method and round(old_cash, 2) == round(new_cash, 2):
+            raise ValueError("This sale already has that payment split.")
+
+        notes = str(sale["notes"] or "")
+        kept_parts = []
+        for part in notes.split("|"):
+            token = part.strip()
+            upper = token.upper()
+            if upper.startswith(("PAYMENT_CASH=", "PAYMENT_WHISH=", "PAYMENT_CARD=")):
+                continue
+            if token:
+                kept_parts.append(token)
+        if new_cash > 0:
+            kept_parts.append(f"PAYMENT_CASH={new_cash:.2f}")
+        if new_whish > 0:
+            kept_parts.append(f"PAYMENT_WHISH={new_whish:.2f}")
+        if new_card > 0:
+            kept_parts.append(f"PAYMENT_CARD={new_card:.2f}")
+        kept_parts.append(
+            f"PAYMENT_CORRECTION={_now_iso()},{old_method}->{new_method},by {actor},reason {clean_reason}"
+        )
+        new_notes = " | ".join(kept_parts)
+
+        cur.execute(
+            "UPDATE sales SET payment_method = ?, cash_paid = ?, notes = ? WHERE id = ?",
+            (new_method, float(new_cash), new_notes, int(sale_id)),
+        )
+
+        shift_variance_before = None
+        shift_variance_after = None
+        shift_id = int(sale["shift_id"] or 0)
+        shift_variance_before, shift_variance_after = _adjust_shift_recorded_variance_cur(
+            cur,
+            shift_id,
+            new_cash - old_cash,
+            f"[Payment correction] Sale #{int(sale_id)} {old_method}->{new_method} "
+            f"by {actor}; cash part {old_cash:.2f}->{new_cash:.2f}.",
+        )
+
+        conn.commit()
+        return {
+            "sale_id": int(sale_id),
+            "shift_id": shift_id,
+            "old_payment_method": old_method,
+            "new_payment_method": new_method,
+            "old_cash_paid": round(old_cash, 2),
+            "old_whish_paid": round(old_whish, 2),
+            "old_card_paid": round(old_card, 2),
+            "new_cash_paid": round(new_cash, 2),
+            "new_whish_paid": round(new_whish, 2),
+            "new_card_paid": round(new_card, 2),
+            "amount_due": round(amount_due, 2),
+            "shift_variance_before": shift_variance_before,
+            "shift_variance_after": shift_variance_after,
+            "notes": new_notes,
+        }
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def update_sale_payment_method(sale_id, payment_method, reason="", changed_by=""):
+    """Correct a sale to one full tender without changing its items, stock, or receipt total."""
+    allowed = {"CASH", "WHISH", "CARD"}
+    new_method = str(payment_method or "").strip().upper()
+    if new_method not in allowed:
+        raise ValueError("Payment method must be Cash, Whish, or Card.")
+
+    conn = get_conn()
+    try:
+        sale = conn.execute("SELECT total_sales, total_amount, store_credit_used FROM sales WHERE id = ? LIMIT 1", (int(sale_id),)).fetchone()
+        if not sale:
+            raise ValueError("Sale not found.")
+        total_sales = float(sale["total_sales"] or sale["total_amount"] or 0.0)
+        store_credit = float(sale["store_credit_used"] or 0.0)
+        amount_due = round(max(0.0, total_sales - store_credit), 2)
+    finally:
+        conn.close()
+    return update_sale_payment_split(
+        sale_id,
+        cash_amount=amount_due if new_method == "CASH" else 0.0,
+        whish_amount=amount_due if new_method == "WHISH" else 0.0,
+        card_amount=amount_due if new_method == "CARD" else 0.0,
+        reason=reason,
+        changed_by=changed_by,
+    )
+
+
+def reverse_cash_movement(movement_id, reason="", changed_by=""):
+    clean_reason = _clean_audit_text(reason)
+    if not clean_reason:
+        raise ValueError("A reason is required to reverse a cash movement.")
+    actor = _clean_audit_text(changed_by, "Manager")
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        movement = cur.execute("SELECT * FROM cash_movements WHERE id = ? LIMIT 1", (int(movement_id),)).fetchone()
+        if not movement:
+            raise ValueError("Cash movement not found.")
+        notes = str(movement["notes"] or "")
+        if f"REVERSAL_OF={int(movement_id)}" in notes:
+            raise ValueError("This movement is already a reversal entry.")
+        already = cur.execute(
+            "SELECT id FROM cash_movements WHERE notes LIKE ? LIMIT 1",
+            (f"%REVERSAL_OF={int(movement_id)}%",),
+        ).fetchone()
+        if already:
+            raise ValueError(f"This movement was already reversed by cash movement #{int(already['id'])}.")
+
+        old_type = str(movement["movement_type"] or "OUT").strip().upper()
+        if old_type not in ("IN", "OUT"):
+            raise ValueError("Only Cash In and Cash Out movements can be reversed.")
+        new_type = "OUT" if old_type == "IN" else "IN"
+        original_amount = round(float(movement["amount_value"] or 0.0), 2)
+        reversal_notes = (
+            f"REVERSAL_OF={int(movement_id)} | by {actor} | reason {clean_reason}"
+        )
+        cur.execute("""
+            INSERT INTO cash_movements (
+                created_at, shift_id, movement_type, amount_usd, amount_lbp,
+                lbp_per_usd, amount_value, reason, employee_id, employee_name, notes
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            _now_iso(),
+            int(movement["shift_id"] or 0),
+            new_type,
+            float(movement["amount_usd"] or 0.0),
+            float(movement["amount_lbp"] or 0.0),
+            float(movement["lbp_per_usd"] or 89500.0),
+            original_amount,
+            f"Reverse cash movement #{int(movement_id)}: {clean_reason}",
+            movement["employee_id"],
+            actor,
+            reversal_notes,
+        ))
+        reversal_id = int(cur.lastrowid)
+        expected_delta = original_amount if new_type == "IN" else -original_amount
+        shift_variance_before, shift_variance_after = _adjust_shift_recorded_variance_cur(
+            cur,
+            int(movement["shift_id"] or 0),
+            expected_delta,
+            f"[Cash movement reversal] Movement #{int(movement_id)} reversed by #{reversal_id} "
+            f"by {actor}; {old_type}->{new_type} {original_amount:.2f}.",
+        )
+        conn.commit()
+        return {
+            "movement_id": int(movement_id),
+            "reversal_movement_id": reversal_id,
+            "shift_id": int(movement["shift_id"] or 0),
+            "old_movement_type": old_type,
+            "new_movement_type": new_type,
+            "amount_usd": round(float(movement["amount_usd"] or 0.0), 2),
+            "amount_lbp": round(float(movement["amount_lbp"] or 0.0), 2),
+            "amount_value": original_amount,
+            "shift_variance_before": shift_variance_before,
+            "shift_variance_after": shift_variance_after,
+        }
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
 def delete_sale(sale_id, restore_stock=True):
     """Delete a sale and its items. If restore_stock=True, adds sold qty back to products.stock_qty."""
     conn = None

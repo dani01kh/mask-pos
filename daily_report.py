@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import sqlite3
 from collections import defaultdict
 from datetime import datetime, timedelta
@@ -105,6 +106,111 @@ def _as_float(value, default: float = 0.0) -> float:
         return float(value or 0.0)
     except Exception:
         return default
+
+
+def _recorded_close_variance(notes):
+    matches = list(re.finditer(r"(?i)variance\s+\$?(-?[0-9]+(?:\.[0-9]+)?)", str(notes or "")))
+    return float(matches[-1].group(1)) if matches else None
+
+
+def _prepare_drawer_reconciliation(shifts, sales, movements, returns, start, end):
+    """Normalize duplicate cloud shells for reporting without mutating store data."""
+    start_text = start.strftime("%Y-%m-%d %H:%M:%S")
+    end_text = end.strftime("%Y-%m-%d %H:%M:%S")
+    period_shifts = [dict(s) for s in shifts if start_text <= str(s.get("opened_at") or "") < end_text]
+
+    linked_sales = defaultdict(list)
+    linked_movements = defaultdict(list)
+    for sale in sales:
+        if sale.get("shift_id") not in (None, "", 0):
+            linked_sales[int(sale["shift_id"])].append(sale)
+    for movement in movements:
+        if movement.get("shift_id") not in (None, "", 0):
+            linked_movements[int(movement["shift_id"])].append(movement)
+
+    grouped = defaultdict(list)
+    for shift in period_shifts:
+        grouped[(
+            str(shift.get("opened_at") or ""),
+            str(shift.get("employee_id") or shift.get("employee_name") or "").strip().casefold(),
+        )].append(shift)
+
+    canonical_shifts = []
+    hidden_shift_shells = 0
+    for group in grouped.values():
+        def score(shift):
+            sid = int(shift.get("id") or 0)
+            movement_value = sum(abs(_as_float(row.get("amount_value"))) for row in linked_movements.get(sid, []))
+            return (
+                len(linked_sales.get(sid, [])),
+                movement_value,
+                abs(_as_float(shift.get("opening_cash"))) + abs(_as_float(shift.get("closing_cash"))),
+                -sid,
+            )
+        canonical_shifts.append(max(group, key=score))
+        hidden_shift_shells += max(0, len(group) - 1)
+    canonical_shifts.sort(key=lambda shift: str(shift.get("opened_at") or ""))
+
+    unique_movements = {}
+    for movement in movements:
+        text = f"{movement.get('reason') or ''} {movement.get('notes') or ''}".lower()
+        if abs(_as_float(movement.get("amount_value"))) < 0.005 and "duplicate cleaned" in text:
+            continue
+        key = (
+            str(movement.get("created_at") or ""),
+            str(movement.get("movement_type") or "").upper(),
+            round(_as_float(movement.get("amount_usd")), 2),
+            round(_as_float(movement.get("amount_lbp")), 2),
+            round(_as_float(movement.get("amount_value")), 2),
+            str(movement.get("reason") or "").strip().casefold(),
+            str(movement.get("employee_name") or "").strip().casefold(),
+        )
+        unique_movements.setdefault(key, movement)
+    clean_movements = list(unique_movements.values())
+
+    shifts_by_day = defaultdict(list)
+    for shift in canonical_shifts:
+        shifts_by_day[str(shift.get("opened_at") or "")[:10]].append(shift)
+    for day_rows in shifts_by_day.values():
+        day_rows.sort(key=lambda shift: str(shift.get("opened_at") or ""))
+
+    def assigned_shift_id(row):
+        timestamp = str(row.get("created_at") or row.get("returned_at") or "")
+        candidates = shifts_by_day.get(timestamp[:10], [])
+        if not candidates:
+            return 0
+        opened = [shift for shift in candidates if str(shift.get("opened_at") or "") <= timestamp]
+        return int((opened[-1] if opened else candidates[0]).get("id") or 0)
+
+    sales_by_shift = defaultdict(list)
+    movements_by_shift = defaultdict(list)
+    returns_by_shift = defaultdict(list)
+    sales_unassigned = []
+    for sale in sales:
+        sid = assigned_shift_id(sale)
+        if sid:
+            sales_by_shift[sid].append(sale)
+        else:
+            sales_unassigned.append(sale)
+    for movement in clean_movements:
+        sid = assigned_shift_id(movement)
+        if sid:
+            movements_by_shift[sid].append(movement)
+    for returned in returns:
+        sid = assigned_shift_id(returned)
+        if sid:
+            returns_by_shift[sid].append(returned)
+
+    return {
+        "shifts": canonical_shifts,
+        "movements": clean_movements,
+        "sales_by_shift": sales_by_shift,
+        "movements_by_shift": movements_by_shift,
+        "returns_by_shift": returns_by_shift,
+        "sales_unassigned": sales_unassigned,
+        "hidden_shift_shells": hidden_shift_shells,
+        "ignored_movement_copies": len(movements) - len(clean_movements),
+    }
 
 
 def _as_int(value, default: int = 0) -> int:
@@ -412,26 +518,13 @@ def build_cash_drawer_pdf(db_path: str, reports_folder: str, year: int, month: i
     movements = rows.get("movements", [])
     returns = rows.get("returns", [])
 
-    sales_by_shift = defaultdict(list)
-    sales_unassigned = []
-    for sale in sales:
-        sid = sale.get("shift_id")
-        if sid in (None, ""):
-            sales_unassigned.append(sale)
-        else:
-            sales_by_shift[int(sid)].append(sale)
-
-    movements_by_shift = defaultdict(list)
-    for movement in movements:
-        sid = movement.get("shift_id")
-        if sid not in (None, ""):
-            movements_by_shift[int(sid)].append(movement)
-
-    returns_by_shift = defaultdict(list)
-    for ret in returns:
-        sid = ret.get("shift_id")
-        if sid not in (None, ""):
-            returns_by_shift[int(sid)].append(ret)
+    prepared = _prepare_drawer_reconciliation(shifts, sales, movements, returns, start, end)
+    shifts = prepared["shifts"]
+    movements = prepared["movements"]
+    sales_by_shift = prepared["sales_by_shift"]
+    movements_by_shift = prepared["movements_by_shift"]
+    returns_by_shift = prepared["returns_by_shift"]
+    sales_unassigned = prepared["sales_unassigned"]
 
     def money_fmt(value) -> str:
         try:
@@ -785,26 +878,13 @@ def build_cash_drawer_pdf(db_path: str, reports_folder: str, year: int = None, m
     movements = rows.get("movements", [])
     returns = rows.get("returns", [])
 
-    sales_by_shift = defaultdict(list)
-    sales_unassigned = []
-    for sale in sales:
-        sid = sale.get("shift_id")
-        if sid in (None, ""):
-            sales_unassigned.append(sale)
-        else:
-            sales_by_shift[int(sid)].append(sale)
-
-    movements_by_shift = defaultdict(list)
-    for movement in movements:
-        sid = movement.get("shift_id")
-        if sid not in (None, ""):
-            movements_by_shift[int(sid)].append(movement)
-
-    returns_by_shift = defaultdict(list)
-    for ret in returns:
-        sid = ret.get("shift_id")
-        if sid not in (None, ""):
-            returns_by_shift[int(sid)].append(ret)
+    prepared = _prepare_drawer_reconciliation(shifts, sales, movements, returns, start, end)
+    shifts = prepared["shifts"]
+    movements = prepared["movements"]
+    sales_by_shift = prepared["sales_by_shift"]
+    movements_by_shift = prepared["movements_by_shift"]
+    returns_by_shift = prepared["returns_by_shift"]
+    sales_unassigned = prepared["sales_unassigned"]
 
     def money_fmt(value) -> str:
         try:
@@ -867,7 +947,9 @@ def build_cash_drawer_pdf(db_path: str, reports_folder: str, year: int = None, m
         status = "OPEN"
         if shift.get("closed_at"):
             counted = _as_float(shift.get("closing_cash"))
-            diff = counted - expected
+            calculated_diff = counted - expected
+            recorded_diff = _recorded_close_variance(shift.get("notes"))
+            diff = recorded_diff if recorded_diff is not None else calculated_diff
             total_variance += diff
             closed_shift_count += 1
             close_taken = close_taken_for_shift(shift_id)
@@ -1112,7 +1194,7 @@ def build_cash_drawer_pdf(db_path: str, reports_folder: str, year: int = None, m
             "",
         ],
         [
-            f"Drawer net: {money_fmt(total_cash_sales + total_cash_in - total_cash_out)}",
+            f"Cash movement (sales + in - out): {money_fmt(total_cash_sales + total_cash_in - total_cash_out)}",
             f"Cash in register: {money_fmt(total_left)}",
             "",
         ],
@@ -1133,6 +1215,11 @@ def build_cash_drawer_pdf(db_path: str, reports_folder: str, year: int = None, m
         attention.append(f"Register variance needs checking: {money_fmt(total_variance)}. Differences within +/- {money_fmt(variance_tolerance)} are treated as OK.")
     if sales_unassigned:
         attention.append(f"{len(sales_unassigned)} sale(s) were not attached to a register shift.")
+    if prepared.get("hidden_shift_shells") or prepared.get("ignored_movement_copies"):
+        attention.append(
+            f"Reconciliation ignored {int(prepared.get('hidden_shift_shells') or 0)} duplicate shift shell(s) "
+            f"and {int(prepared.get('ignored_movement_copies') or 0)} duplicate cash movement copy/copies."
+        )
     if latest_open_shift:
         attention.append(f"Open register should currently hold about {money_fmt(total_left)}.")
     if not attention:
@@ -1158,6 +1245,8 @@ def build_cash_drawer_pdf(db_path: str, reports_folder: str, year: int = None, m
             "taken_at_close": round(total_close_taken, 2),
             "left_for_next_opening": round(total_left, 2),
             "variance": round(total_variance, 2),
+            "hidden_shift_shells": int(prepared.get("hidden_shift_shells") or 0),
+            "ignored_movement_copies": int(prepared.get("ignored_movement_copies") or 0),
             "balanced": bool(balanced),
         },
     }
@@ -1504,7 +1593,7 @@ def _build_sales_report_excel_v2(
         ["Cash refunds", total_cash_refunds],
         ["Cash added", total_cash_in],
         ["Cash removed", total_cash_out],
-        ["Drawer net change", total_cash + total_cash_in - total_cash_out - total_cash_refunds],
+        ["Cash movement (not variance)", total_cash + total_cash_in - total_cash_out - total_cash_refunds],
     ]
     ws_dash["A5"] = "Business Summary"
     ws_dash["A5"].font = section_font
@@ -1592,7 +1681,7 @@ def _build_sales_report_excel_v2(
     daily_headers = [
         "Day", "Orders", "Qty Sold", "Qty Returned", "Net Qty", "Sales Revenue",
         "Return Amount", "Net Sales", "Cash Collected", "Store Credit", "Cash Refunds",
-        "Cash Added", "Cash Removed", "Drawer Net", "AOV",
+        "Cash Added", "Cash Removed", "Cash Movement (Not Variance)", "AOV",
     ]
     daily_data = []
     for day in days:
@@ -2040,7 +2129,7 @@ def build_sales_report_excel_range(db_path: str, reports_folder: str, start_date
         ("Net Merchandise Sales", total_merch - total_returns),
         ("Cash Added To Drawer", total_cash_in),
         ("Cash Removed From Drawer", total_cash_out),
-        ("Drawer Net Change", total_cash + total_cash_in - total_cash_out),
+        ("Cash Movement (Not Variance)", total_cash + total_cash_in - total_cash_out),
         ("Closed Shifts", sum(1 for s in shifts if s.get("closed_at"))),
         ("Open Shifts In Period", sum(1 for s in shifts if not s.get("closed_at"))),
     ]
@@ -2079,7 +2168,7 @@ def build_sales_report_excel_range(db_path: str, reports_folder: str, start_date
 
         ds = daily_summary(day)
         ws_day.append([])
-        ws_day.append(["Daily Total", ds["merch"], "Cash Collected", ds["cash"], "Drawer Net", ds["drawer_net"]])
+        ws_day.append(["Daily Total", ds["merch"], "Cash Collected", ds["cash"], "Cash Movement (Not Variance)", ds["drawer_net"]])
         for cell in ws_day[3]:
             cell.font = h_font
             cell.fill = total_fill

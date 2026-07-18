@@ -242,6 +242,7 @@ def _local_db_available_or_warn(action_name: str) -> bool:
 import subprocess
 import time
 import threading
+import queue
 import sqlite3
 import calendar
 import re
@@ -314,7 +315,7 @@ from backend import (
     reorder_suggestions, analytics_discount_impact, get_sale_detail, get_sale_detail_with_returns,
     get_sale_by_receipt_scan, create_return, list_returns_for_sale,
     create_bon, get_bon_by_code, list_bons, void_bon,
-    delete_sale, void_sale,
+    delete_sale, void_sale, update_sale_payment_method, update_sale_payment_split, reverse_cash_movement,
     backup_pos_db, open_backups_folder, get_backup_config, set_backup_rclone_remote,
     list_printers,
     clear_printer_queue,
@@ -375,8 +376,21 @@ from ai_assistant import (
     ask_gemini,
     audit_assistant_event,
     build_business_context,
+    capture_action_state,
     describe_action,
     execute_approved_action,
+)
+from inventory_tools import (
+    delete_view as delete_inventory_view,
+    ensure_schema as ensure_inventory_tools_schema,
+    get_lifecycle as get_product_lifecycle,
+    inventory_metrics,
+    list_actions as list_inventory_actions,
+    list_views as list_inventory_views,
+    mark_reversed as mark_inventory_action_reversed,
+    record_action as record_inventory_action,
+    save_view as save_inventory_view,
+    set_lifecycle as set_product_lifecycle,
 )
 
 try:
@@ -701,6 +715,8 @@ def payment_method_label(value) -> str:
         "CASH+WHISH": "Cash + Whish",
         "CASH+CARD": "Cash + Credit Card",
         "CASH+CREDIT_CARD": "Cash + Credit Card",
+        "WHISH+CARD": "Whish + Credit Card",
+        "CASH+WHISH+CARD": "Cash + Whish + Credit Card",
         # UI-internal values before DB normalisation (Bug 4 fix)
         "CASH_WHISH": "Cash + Whish",
         "CASH_CARD": "Cash + Credit Card",
@@ -1418,6 +1434,7 @@ class MaskPOS(tk.Tk):
         self.offers_page = None
         self.settings_page = None
         self.ai_assistant_page = None
+        self.inventory_tools_page = None
 
         # Hotkey: Ctrl+P to reprint receipt from anywhere
         try:
@@ -1437,7 +1454,7 @@ class MaskPOS(tk.Tk):
             "OffersPage": lambda: OffersPage(self.content_scroll_inner),
             "SettingsPage": lambda: SettingsPage(self.content_scroll_inner),
             "AIAssistantPage": lambda: AIAssistantPage(self.content_scroll_inner),
-            "DataHealthPage": lambda: DataHealthPage(self.content_scroll_inner),
+            "InventoryToolsPage": lambda: InventoryToolsPage(self.content_scroll_inner),
         }
         self._page_attrs = {
             "ProductsPage": "products_page",
@@ -1449,7 +1466,7 @@ class MaskPOS(tk.Tk):
             "OffersPage": "offers_page",
             "SettingsPage": "settings_page",
             "AIAssistantPage": "ai_assistant_page",
-            "DataHealthPage": "data_health_page",
+            "InventoryToolsPage": "inventory_tools_page",
         }
 
         for p in self.pages.values():
@@ -1510,9 +1527,9 @@ class MaskPOS(tk.Tk):
             ("🔁", "Returns / Exchange", "ReturnsPage"),
             ("📦", "Products", "ProductsPage"),
             ("🏷", "Barcodes", "BarcodesPage"),
-            ("🩺", "Data Health", "DataHealthPage"),
             ("📈", "Analytics", "AnalyticsPage"),
             ("AI", "AI Assistant", "AIAssistantPage"),
+            ("INV", "Inventory Tools", "InventoryToolsPage"),
             ("⚙️", "Settings", "SettingsPage"),
         ]
 
@@ -1720,11 +1737,6 @@ class MaskPOS(tk.Tk):
                     pass
                 try:
                     self.shifts_page.load_day(silent=True)
-                except Exception:
-                    pass
-            elif self._active_page == "ShiftHistoryPage":
-                try:
-                    self.shift_history_page.load_day()
                 except Exception:
                     pass
         finally:
@@ -2070,7 +2082,7 @@ class MaskPOS(tk.Tk):
             f"Cash collected: {money(summary.get('cash_collected', 0.0))}\n"
             f"Returns / refunds: {money(summary.get('returns', 0.0))} total, {money(summary.get('cash_refunds', 0.0))} cash\n"
             f"Drawer movement: +{money(summary.get('cash_added', 0.0))} in, -{money(summary.get('cash_removed', 0.0))} out\n"
-            f"Drawer net cash change: {money(drawer_net)}\n"
+            f"Cash movement after sales, refunds, cash in/out (not variance): {money(drawer_net)}\n"
             f"Orders: {int(summary.get('orders', 0) or 0)}\n\n"
             "Attached: Excel details + PDF with sales list and drawer summary."
         )
@@ -6024,6 +6036,452 @@ def open_product_price_history_window(parent, product_id, product_name=""):
     GhostButton(card.inner,"Close",win.destroy).pack(anchor="e")
 
 
+class InventoryToolsPage(tk.Frame):
+    """Optional recommendations, counting, receiving, clearance, and safe undo."""
+
+    FILTERS = (
+        "ALL", "OUT", "NEGATIVE", "LOW", "REORDER_SOON", "OVERSTOCK",
+        "LOW_PERFORMING", "NO_SALE_30", "NO_SALE_60", "NO_SALE_90", "ONE_TIME",
+    )
+
+    def __init__(self, parent):
+        super().__init__(parent, bg=UI.CONTENT_BG)
+        self.db_path = data_path("pos.db")
+        self.metric_rows = {}
+        self.count_rows = {}
+        ensure_inventory_tools_schema(self.db_path)
+        self._build()
+        self.refresh_all()
+
+    def _actor(self):
+        try:
+            shift = get_open_shift()
+            return str(row_get(shift, "employee_name", "") or "Manager").strip() or "Manager"
+        except Exception:
+            return "Manager"
+
+    def _manager_ok(self, title="Manager authorization"):
+        password = simpledialog.askstring(title, "Enter the manager password:", show="*", parent=self.winfo_toplevel())
+        return password is not None and verify_mode_admin_password(password)
+
+    def _build(self):
+        outer = tk.Frame(self, bg=UI.CONTENT_BG)
+        outer.pack(fill="both", expand=True, padx=18, pady=18)
+        head = Card(outer, padx=18, pady=14); head.pack(fill="x")
+        HeaderBar(head.inner, "Inventory Tools", "Optional recommendations only. Nothing is reordered, counted, discounted, or reversed without approval.").pack(fill="x")
+        self.tabs = ttk.Notebook(outer); self.tabs.pack(fill="both", expand=True, pady=(12, 0))
+        self.intel_tab = tk.Frame(self.tabs, bg=UI.CARD)
+        self.count_tab = tk.Frame(self.tabs, bg=UI.CARD)
+        self.receive_tab = tk.Frame(self.tabs, bg=UI.CARD)
+        self.clearance_tab = tk.Frame(self.tabs, bg=UI.CARD)
+        self.history_tab = tk.Frame(self.tabs, bg=UI.CARD)
+        self.health_tab = tk.Frame(self.tabs, bg=UI.CARD)
+        for frame, title in ((self.intel_tab, "Intelligence"), (self.count_tab, "Stock Count"),
+                             (self.receive_tab, "Receiving"), (self.clearance_tab, "Clearance"),
+                             (self.history_tab, "Action History / Reverse"),
+                             (self.health_tab, "Data Health")):
+            self.tabs.add(frame, text=title)
+        self._build_intelligence()
+        self._build_stock_count()
+        self._build_receiving()
+        self._build_clearance()
+        self._build_history()
+        self.data_health_page = DataHealthPage(self.health_tab)
+        self.data_health_page.pack(fill="both", expand=True)
+
+    def _build_intelligence(self):
+        controls = tk.Frame(self.intel_tab, bg=UI.CARD); controls.pack(fill="x", padx=12, pady=12)
+        self.analysis_days = tk.StringVar(value="60")
+        self.coverage_days = tk.StringVar(value="14")
+        self.inventory_filter = tk.StringVar(value="ALL")
+        self.saved_view_var = tk.StringVar(value="")
+        for label, var, width in (("Sales history days", self.analysis_days, 6), ("Suggested coverage days", self.coverage_days, 6)):
+            tk.Label(controls, text=label, bg=UI.CARD, fg=UI.TEXT).pack(side="left", padx=(0, 4))
+            tk.Entry(controls, textvariable=var, width=width, bd=1, relief="solid").pack(side="left", padx=(0, 10))
+        ttk.Combobox(controls, textvariable=self.inventory_filter, values=self.FILTERS, state="readonly", width=18).pack(side="left")
+        PrimaryButton(controls, "Refresh", self.load_intelligence).pack(side="left", padx=(8, 0))
+        tk.Label(controls, text="Saved view", bg=UI.CARD, fg=UI.TEXT).pack(side="left", padx=(18, 4))
+        self.saved_view_cb = ttk.Combobox(controls, textvariable=self.saved_view_var, state="readonly", width=18)
+        self.saved_view_cb.pack(side="left"); self.saved_view_cb.bind("<<ComboboxSelected>>", lambda _e: self._apply_saved_view())
+        GhostButton(controls, "Save View", self._save_current_view).pack(side="left", padx=(6, 0))
+        GhostButton(controls, "Delete View", self._delete_current_view).pack(side="left", padx=(6, 0))
+
+        tk.Label(self.intel_tab,text="Recommended stock floor = average daily sales × coverage days + demand deviation × √coverage days. Performance score = recent activity + sell-through + velocity + revenue + margin.",bg=UI.CARD,fg=UI.MUTED,anchor="w",justify="left",wraplength=1100).pack(fill="x",padx=12,pady=(0,8))
+
+        cols = ("name", "life", "stock", "sold", "daily", "floor", "order", "cover", "score", "flags")
+        self.intel_tree = ttk.Treeview(self.intel_tab, columns=cols, show="headings", height=15)
+        specs = (("name", "Product", 230), ("life", "Type", 80), ("stock", "Stock", 55), ("sold", "Sold", 55),
+                 ("daily", "/ Day", 60), ("floor", "Stock Floor", 75), ("order", "Suggested", 70),
+                 ("cover", "Days Cover", 75), ("score", "Score", 55), ("flags", "Status", 210))
+        for col, title, width in specs:
+            self.intel_tree.heading(col, text=title); self.intel_tree.column(col, width=width, anchor=("w" if col in {"name", "flags"} else "center"))
+        self.intel_tree.pack(fill="both", expand=True, padx=12)
+        self.intel_tree.bind("<<TreeviewSelect>>", lambda _e: self._show_metric_detail())
+        bottom = tk.Frame(self.intel_tab, bg=UI.CARD); bottom.pack(fill="x", padx=12, pady=12)
+        self.intel_detail = tk.StringVar(value="Select a product to see why it was classified.")
+        tk.Label(bottom, textvariable=self.intel_detail, bg=UI.CARD, fg=UI.MUTED, anchor="w", justify="left", wraplength=820).pack(side="left", fill="x", expand=True)
+        self.lifecycle_var = tk.StringVar(value="")
+        ttk.Combobox(bottom, textvariable=self.lifecycle_var, values=("", "CORE", "SEASONAL", "ONE_TIME"), state="readonly", width=12).pack(side="left", padx=(8, 0))
+        GhostButton(bottom, "Save Optional Type", self._save_lifecycle).pack(side="left", padx=(6, 0))
+        GhostButton(bottom, "Product History", self._open_selected_history).pack(side="left", padx=(6, 0))
+
+    def _build_stock_count(self):
+        controls = tk.Frame(self.count_tab, bg=UI.CARD); controls.pack(fill="x", padx=14, pady=14)
+        self.count_barcode = tk.StringVar(); self.count_qty = tk.StringVar()
+        tk.Label(controls, text="Scan barcode", bg=UI.CARD, fg=UI.TEXT).pack(side="left")
+        entry = tk.Entry(controls, textvariable=self.count_barcode, width=22, bd=1, relief="solid"); entry.pack(side="left", padx=6)
+        entry.bind("<Return>", lambda _e: self._add_count_row())
+        tk.Label(controls, text="Counted qty", bg=UI.CARD, fg=UI.TEXT).pack(side="left")
+        tk.Entry(controls, textvariable=self.count_qty, width=8, bd=1, relief="solid").pack(side="left", padx=6)
+        PrimaryButton(controls, "Add Count", self._add_count_row).pack(side="left")
+        GhostButton(controls, "Clear", self._clear_counts).pack(side="left", padx=6)
+        cols=("name","barcode","system","counted","difference")
+        self.count_tree=ttk.Treeview(self.count_tab,columns=cols,show="headings",height=15)
+        for col,title,width in (("name","Product",260),("barcode","Barcode",145),("system","System",75),("counted","Counted",75),("difference","Difference",80)):
+            self.count_tree.heading(col,text=title); self.count_tree.column(col,width=width,anchor=("w" if col=="name" else "center"))
+        self.count_tree.pack(fill="both",expand=True,padx=14)
+        tk.Label(self.count_tab,text="Counts remain a review list until you approve Apply Differences.",bg=UI.CARD,fg=UI.MUTED).pack(anchor="w",padx=14,pady=(8,0))
+        PrimaryButton(self.count_tab,"Apply Differences",self._apply_counts).pack(anchor="e",padx=14,pady=12)
+
+    def _build_receiving(self):
+        box = tk.Frame(self.receive_tab, bg=UI.CARD); box.pack(fill="x", padx=18, pady=18)
+        self.receive_barcode=tk.StringVar(); self.receive_qty=tk.StringVar(); self.receive_cost=tk.StringVar(); self.receive_price=tk.StringVar(); self.receive_note=tk.StringVar(value="Stock received"); self.receive_print=tk.BooleanVar(value=False)
+        for row,(label,var) in enumerate((("Product barcode",self.receive_barcode),("Quantity received",self.receive_qty),("New cost (optional)",self.receive_cost),("New sell price (optional)",self.receive_price),("Note",self.receive_note))):
+            tk.Label(box,text=label,bg=UI.CARD,fg=UI.TEXT).grid(row=row,column=0,sticky="w",pady=6)
+            tk.Entry(box,textvariable=var,width=36,bd=1,relief="solid").grid(row=row,column=1,sticky="w",padx=10,pady=6)
+        tk.Checkbutton(box,text="Print labels for received quantity",variable=self.receive_print,bg=UI.CARD,fg=UI.TEXT,activebackground=UI.CARD).grid(row=5,column=1,sticky="w",padx=8,pady=6)
+        tk.Label(box,text="Nothing is changed until you confirm. Optional fields can stay blank.",bg=UI.CARD,fg=UI.MUTED).grid(row=6,column=0,columnspan=2,sticky="w",pady=(8,12))
+        PrimaryButton(box,"Receive Stock",self._receive_stock).grid(row=7,column=1,sticky="w",padx=10)
+        self.receive_status=tk.StringVar(value="")
+        tk.Label(box,textvariable=self.receive_status,bg=UI.CARD,fg=UI.MUTED,justify="left").grid(row=8,column=0,columnspan=2,sticky="w",pady=12)
+
+    def _build_clearance(self):
+        controls=tk.Frame(self.clearance_tab,bg=UI.CARD); controls.pack(fill="x",padx=12,pady=12)
+        tk.Label(controls,text="Recommendations only; price and cost are used to avoid suggesting a sale below cost.",bg=UI.CARD,fg=UI.MUTED).pack(side="left",fill="x",expand=True)
+        PrimaryButton(controls,"Refresh",self.load_clearance).pack(side="right")
+        GhostButton(controls,"Compare Discount Levels",self._show_clearance_options).pack(side="right",padx=(0,8))
+        cols=("name","stock","sold","last","score","price","cost","discount","sale_price")
+        self.clearance_tree=ttk.Treeview(self.clearance_tab,columns=cols,show="headings",height=15)
+        for col,title,width in (("name","Product",230),("stock","Stock",55),("sold","Sold",55),("last","Days Since Sale",90),("score","Score",55),("price","Price",70),("cost","Cost",70),("discount","Suggested %",80),("sale_price","Sale Price",75)):
+            self.clearance_tree.heading(col,text=title); self.clearance_tree.column(col,width=width,anchor=("w" if col=="name" else "center"))
+        self.clearance_tree.pack(fill="both",expand=True,padx=12)
+        PrimaryButton(self.clearance_tab,"Apply Suggested Discount",self._apply_clearance).pack(anchor="e",padx=12,pady=12)
+
+    def _build_history(self):
+        controls=tk.Frame(self.history_tab,bg=UI.CARD); controls.pack(fill="x",padx=12,pady=12)
+        tk.Label(controls,text="Reverse creates a new compensating action and never erases history.",bg=UI.CARD,fg=UI.MUTED).pack(side="left",fill="x",expand=True)
+        GhostButton(controls,"Refresh",self.load_action_history).pack(side="right")
+        cols=("time","status","type","product","description","actor")
+        self.action_tree=ttk.Treeview(self.history_tab,columns=cols,show="headings",height=16)
+        for col,title,width in (("time","Time",150),("status","Status",75),("type","Action",120),("product","Product",180),("description","Description",330),("actor","Employee",100)):
+            self.action_tree.heading(col,text=title); self.action_tree.column(col,width=width,anchor="w")
+        self.action_tree.pack(fill="both",expand=True,padx=12)
+        DangerButton(self.history_tab,"Reverse Selected Action",self._reverse_selected_action).pack(anchor="e",padx=12,pady=12)
+
+    def refresh_all(self):
+        self._refresh_saved_views(); self.load_intelligence(); self.load_clearance(); self.load_action_history()
+        try:
+            self.data_health_page.refresh()
+        except Exception:
+            pass
+
+    def load_intelligence(self):
+        try:
+            rows=inventory_metrics(self.db_path,int(self.analysis_days.get()),int(self.coverage_days.get()))
+        except Exception as exc:
+            messagebox.showerror("Inventory Intelligence",str(exc)); return
+        filter_key=self.inventory_filter.get() or "ALL"
+        self.intel_tree.delete(*self.intel_tree.get_children()); self.metric_rows={}
+        for row in rows:
+            flags=list(row.get("flags") or [])
+            life=str(row.get("lifecycle_type") or "")
+            if filter_key!="ALL" and not (filter_key=="ONE_TIME" and life=="ONE_TIME") and filter_key not in flags:
+                continue
+            pid=int(row.get("id") or 0); self.metric_rows[pid]=row
+            cover=row.get("days_cover")
+            self.intel_tree.insert("",tk.END,iid=str(pid),values=(row.get("name",""),life or "Optional",row.get("stock_qty",0),f"{float(row.get('units_sold',0)):.0f}",f"{float(row.get('avg_daily_units',0)):.2f}",row.get("recommended_floor",0),row.get("suggested_qty",0),(f"{float(cover):.1f}" if cover is not None else "—"),row.get("performance_score",0),", ".join(flags) or "OK"))
+        self._show_metric_detail()
+
+    def _selected_metric(self):
+        sel=self.intel_tree.selection()
+        return self.metric_rows.get(int(sel[0])) if sel else None
+
+    def _show_metric_detail(self):
+        row=self._selected_metric()
+        if not row:
+            self.intel_detail.set("Select a product to see why it was classified."); self.lifecycle_var.set(""); return
+        self.lifecycle_var.set(str(row.get("lifecycle_type") or ""))
+        parts=row.get("score_components") or {}
+        self.intel_detail.set(f"{row.get('explanation')}  |  Sell-through {row.get('sell_through_pct')}%  |  Buffer {row.get('demand_buffer')}  |  Revenue {money(row.get('revenue',0))}  |  Score parts: activity {parts.get('recent_activity',0)}, sell-through {parts.get('sell_through',0)}, velocity {parts.get('sales_velocity',0)}, revenue {parts.get('revenue',0)}, margin {parts.get('margin',0)}")
+
+    def _save_lifecycle(self):
+        row=self._selected_metric()
+        if not row: messagebox.showinfo("Select","Select a product first."); return
+        before=str(row.get("lifecycle_type") or ""); after=self.lifecycle_var.get()
+        if before==after: return
+        set_product_lifecycle(self.db_path,row.get("barcode",""),after)
+        record_inventory_action(self.db_path,action_type="LIFECYCLE",product_id=row.get("id"),barcode=row.get("barcode",""),product_name=row.get("name",""),description=f"Optional type {before or 'blank'} -> {after or 'blank'}",before={"lifecycle":before},after={"lifecycle":after},actor=self._actor())
+        self.refresh_all()
+
+    def _refresh_saved_views(self):
+        self.saved_views={r["name"]:r for r in list_inventory_views(self.db_path)}
+        self.saved_view_cb["values"]=list(self.saved_views)
+
+    def _save_current_view(self):
+        name=simpledialog.askstring("Save Inventory View","View name:",parent=self.winfo_toplevel())
+        if not name: return
+        save_inventory_view(self.db_path,name,self.inventory_filter.get()); self._refresh_saved_views(); self.saved_view_var.set(name)
+
+    def _apply_saved_view(self):
+        row=getattr(self,"saved_views",{}).get(self.saved_view_var.get())
+        if row: self.inventory_filter.set(row.get("filter_key") or "ALL"); self.load_intelligence()
+
+    def _delete_current_view(self):
+        name=self.saved_view_var.get()
+        if not name: return
+        delete_inventory_view(self.db_path,name); self.saved_view_var.set(""); self._refresh_saved_views()
+
+    def _add_count_row(self):
+        bc=self.count_barcode.get().strip(); product=find_product_by_barcode(bc)
+        if not product: messagebox.showerror("Stock Count",f"Product not found: {bc}"); return
+        try: counted=int(float(self.count_qty.get().strip()))
+        except Exception: messagebox.showerror("Stock Count","Enter the counted quantity."); return
+        pid=int(row_get(product,"id",0)); system=int(row_get(product,"stock_qty",0) or 0)
+        self.count_rows[pid]={"product":dict(product),"counted":counted,"system":system}
+        self.count_tree.delete(*self.count_tree.get_children())
+        for key,row in self.count_rows.items():
+            p=row["product"]; self.count_tree.insert("",tk.END,iid=str(key),values=(row_get(p,"name",""),row_get(p,"barcode",""),row["system"],row["counted"],row["counted"]-row["system"]))
+        self.count_barcode.set(""); self.count_qty.set("")
+
+    def _clear_counts(self):
+        self.count_rows.clear(); self.count_tree.delete(*self.count_tree.get_children())
+
+    def _apply_counts(self):
+        changes=[r for r in self.count_rows.values() if r["counted"]!=r["system"]]
+        if not changes: messagebox.showinfo("Stock Count","There are no differences to apply."); return
+        if not messagebox.askyesno("Apply Stock Count",f"Apply {len(changes)} reviewed stock difference(s)?"): return
+        if not self._manager_ok(): messagebox.showerror("Denied","Manager authorization failed."); return
+        for row in changes:
+            p=row["product"]; delta=row["counted"]-row["system"]
+            if not adjust_stock(int(row_get(p,"id",0)),delta,"Approved physical stock count","STOCK_COUNT",employee_name=self._actor()):
+                messagebox.showerror("Stock Count",f"Could not update {row_get(p,'name','product')}"); return
+            record_inventory_action(self.db_path,action_type="STOCK_COUNT",product_id=row_get(p,"id",0),barcode=row_get(p,"barcode",""),product_name=row_get(p,"name",""),description=f"Physical count {row['system']} -> {row['counted']}",before={"stock_qty":row["system"]},after={"stock_qty":row["counted"]},actor=self._actor())
+        self._clear_counts(); self.refresh_all(); messagebox.showinfo("Stock Count","Reviewed differences were applied.")
+
+    def _receive_stock(self):
+        product=find_product_by_barcode(self.receive_barcode.get().strip())
+        if not product: messagebox.showerror("Receiving","Product not found."); return
+        try: qty=int(float(self.receive_qty.get().strip()))
+        except Exception: qty=0
+        if qty<=0: messagebox.showerror("Receiving","Quantity must be greater than zero."); return
+        cost_text=self.receive_cost.get().strip(); new_cost=None
+        if cost_text:
+            try: new_cost=max(0.0,float(cost_text))
+            except Exception: messagebox.showerror("Receiving","Cost must be a number or blank."); return
+        price_text=self.receive_price.get().strip(); new_price=None
+        if price_text:
+            try: new_price=max(0.0,float(price_text))
+            except Exception: messagebox.showerror("Receiving","Sell price must be a number or blank."); return
+        before={"stock_qty":int(row_get(product,"stock_qty",0) or 0),"cost_price":float(row_get(product,"cost_price",0) or 0),"supplier":str(row_get(product,"supplier","") or ""),"sell_price":float(row_get(product,"sell_price",0) or 0)}
+        after=dict(before); after["stock_qty"]+=qty
+        if new_cost is not None: after["cost_price"]=new_cost
+        if new_price is not None: after["sell_price"]=new_price
+        if not messagebox.askyesno("Receive Stock",f"Add {qty} unit(s) to {row_get(product,'name','product')}?\n\nStock: {before['stock_qty']} -> {after['stock_qty']}"): return
+        if not self._manager_ok(): messagebox.showerror("Denied","Manager authorization failed."); return
+        pid=int(row_get(product,"id",0))
+        if not adjust_stock(pid,qty,self.receive_note.get().strip() or "Stock received","RECEIVING",employee_name=self._actor()): messagebox.showerror("Receiving","Stock update failed."); return
+        if new_cost is not None: update_product_details(pid,new_cost,before["supplier"])
+        if new_price is not None:
+            update_product(pid,str(row_get(product,"name","") or ""),new_price,after["stock_qty"],int(row_get(product,"low_stock_level",0) or 0),str(row_get(product,"location","") or ""),str(row_get(product,"category","") or ""),str(row_get(product,"brand","") or ""))
+        printed=False
+        if self.receive_print.get():
+            printed=bool(print_configured_barcodes([{"name":str(row_get(product,"name","") or ""),"price":after["sell_price"],"barcode":str(row_get(product,"barcode","") or ""),"location":str(row_get(product,"location","") or ""),"qty":qty}],title=f"{row_get(product,'name','Product')} Received Stock"))
+        record_inventory_action(self.db_path,action_type="RECEIVING",product_id=pid,barcode=row_get(product,"barcode",""),product_name=row_get(product,"name",""),description=f"Received {qty} unit(s)",before=before,after=after,actor=self._actor())
+        self.receive_status.set(f"Received {qty} x {row_get(product,'name','')}. Stock is now {after['stock_qty']}." + (" Labels printed." if printed else ""))
+        self.receive_barcode.set(""); self.receive_qty.set(""); self.receive_cost.set(""); self.receive_price.set(""); self.receive_print.set(False); self.refresh_all()
+
+    def load_clearance(self):
+        try: rows=inventory_metrics(self.db_path,int(self.analysis_days.get()),int(self.coverage_days.get()))
+        except Exception: rows=[]
+        self.clearance_tree.delete(*self.clearance_tree.get_children()); self.clearance_rows={}
+        for row in rows:
+            if "LOW_PERFORMING" not in row.get("flags",[]) and "OVERSTOCK" not in row.get("flags",[]): continue
+            score=int(row.get("performance_score",0)); discount=30 if score<20 else 20 if score<35 else 10
+            price=float(row.get("sell_price",0) or 0); cost=float(row.get("cost_price",0) or 0)
+            sale=round(price*(1-discount/100.0),2)
+            if cost>0 and sale<cost: discount=max(0,int((1-cost/price)*100)) if price>0 else 0; sale=round(price*(1-discount/100.0),2)
+            row=dict(row); row["clearance_discount"]=discount; row["clearance_price"]=sale
+            pid=int(row.get("id") or 0); self.clearance_rows[pid]=row
+            self.clearance_tree.insert("",tk.END,iid=str(pid),values=(row.get("name",""),row.get("stock_qty",0),f"{float(row.get('units_sold',0)):.0f}",row.get("days_since_sale") if row.get("days_since_sale") is not None else "No sale",score,money(price),money(cost),discount,money(sale)))
+
+    def _apply_clearance(self):
+        sel=self.clearance_tree.selection()
+        if not sel: messagebox.showinfo("Clearance","Select a product first."); return
+        row=self.clearance_rows[int(sel[0])]; pct=float(row.get("clearance_discount",0) or 0)
+        if pct<=0: messagebox.showinfo("Clearance","No safe discount is recommended because of the entered cost."); return
+        if not messagebox.askyesno("Apply Clearance",f"Apply the optional {pct:.0f}% discount to {row.get('name')}?\n\nRecommended sale price: {money(row.get('clearance_price',0))}"): return
+        if not self._manager_ok(): messagebox.showerror("Denied","Manager authorization failed."); return
+        bc=str(row.get("barcode") or ""); before=(get_seasonal_sales_map() or {}).get(bc)
+        set_seasonal_sale_item(bc,pct); set_seasonal_sale_enabled(True); after=(get_seasonal_sales_map() or {}).get(bc)
+        record_inventory_action(self.db_path,action_type="CLEARANCE",product_id=row.get("id"),barcode=bc,product_name=row.get("name",""),description=f"Applied recommended {pct:.0f}% discount",before={"offer":before},after={"offer":after},actor=self._actor())
+        self.load_action_history(); messagebox.showinfo("Clearance","Discount applied. It can be safely reversed from Action History.")
+
+    def _show_clearance_options(self):
+        sel=self.clearance_tree.selection()
+        if not sel: messagebox.showinfo("Clearance","Select a product first."); return
+        row=self.clearance_rows[int(sel[0])]
+        stock=max(0,int(row.get("stock_qty",0) or 0)); price=float(row.get("sell_price",0) or 0); cost=float(row.get("cost_price",0) or 0)
+        win=tk.Toplevel(self); win.title(f"Clearance Options - {row.get('name','')}"); win.geometry("690x360"); win.configure(bg=UI.CONTENT_BG)
+        card=Card(win,padx=14,pady=14); card.pack(fill="both",expand=True,padx=12,pady=12)
+        HeaderBar(card.inner,str(row.get("name","Product")),f"Current stock {stock} | Current price {money(price)} | Cost {money(cost)}").pack(fill="x")
+        cols=("discount","unit_price","unit_profit","stock_revenue","stock_profit","status")
+        tree=ttk.Treeview(card.inner,columns=cols,show="headings",height=7)
+        for col,title,width in (("discount","Discount",75),("unit_price","Unit Price",90),("unit_profit","Unit Profit",90),("stock_revenue","If All Sell",100),("stock_profit","Gross Profit",100),("status","Cost Check",100)):
+            tree.heading(col,text=title); tree.column(col,width=width,anchor="center")
+        suggested=int(row.get("clearance_discount",0) or 0)
+        for pct in sorted({10,20,30,suggested}):
+            if pct<=0: continue
+            sale=round(price*(1-pct/100.0),2); unit_profit=round(sale-cost,2); safe=(cost<=0 or sale>=cost)
+            tree.insert("",tk.END,values=(f"{pct}%" + (" recommended" if pct==suggested else ""),money(sale),money(unit_profit),money(sale*stock),money(unit_profit*stock),"Above cost" if safe else "Below cost"))
+        tree.pack(fill="both",expand=True,pady=(12,0)); GhostButton(card.inner,"Close",win.destroy).pack(anchor="e",pady=(10,0))
+
+    def load_action_history(self):
+        self.action_rows={r["id"]:r for r in list_inventory_actions(self.db_path,limit=1000)}
+        self.action_tree.delete(*self.action_tree.get_children())
+        for aid,row in self.action_rows.items():
+            self.action_tree.insert("",tk.END,iid=str(aid),values=(row.get("created_at",""),row.get("status",""),row.get("action_type",""),row.get("product_name","") or row.get("barcode",""),row.get("description",""),row.get("actor","")))
+
+    @staticmethod
+    def _offers_equal(a,b):
+        return json.dumps(a,sort_keys=True,default=str)==json.dumps(b,sort_keys=True,default=str)
+
+    def _reverse_selected_action(self):
+        sel=self.action_tree.selection()
+        if not sel: messagebox.showinfo("Reverse Action","Select an action first."); return
+        row=self.action_rows[int(sel[0])]
+        if row.get("status")!="APPLIED": messagebox.showinfo("Reverse Action","This action is not available for reversal."); return
+        kind=str(row.get("action_type") or ""); before=row.get("before") or {}; after=row.get("after") or {}
+        product=find_product_by_barcode(row.get("barcode","")) if row.get("barcode") else None
+        if not messagebox.askyesno("Reverse Action",f"Reverse this action?\n\n{row.get('description','')}\n\nA new compensating history entry will be created."): return
+        if not self._manager_ok("Reverse action authorization"): messagebox.showerror("Denied","Manager authorization failed."); return
+        if kind in {"STOCK_COUNT","RECEIVING","AI_adjust_stock"}:
+            if not product: messagebox.showerror("Reverse Action","Product no longer exists."); return
+            current=int(row_get(product,"stock_qty",0) or 0)
+            if current!=int(after.get("stock_qty",current)): messagebox.showerror("Reverse Action","Stock changed again after this action. Reversal was blocked to protect newer work."); return
+            if kind=="RECEIVING":
+                if round(float(row_get(product,"cost_price",0) or 0),4)!=round(float(after.get("cost_price",0) or 0),4) or round(float(row_get(product,"sell_price",0) or 0),4)!=round(float(after.get("sell_price",0) or 0),4):
+                    messagebox.showerror("Reverse Action","The price or cost changed again after receiving. Reversal was blocked to protect newer work."); return
+            target=int(before.get("stock_qty",current));
+            if not adjust_stock(int(row_get(product,"id",0)),target-current,f"Reverse action #{row['id']}","REVERSAL",reference_type="ACTION",reference_id=str(row["id"]),employee_name=self._actor()): messagebox.showerror("Reverse Action","Stock reversal failed."); return
+            if kind=="RECEIVING" and ("cost_price" in before):
+                pid=int(row_get(product,"id",0)); update_product_details(pid,float(before.get("cost_price",0) or 0),str(before.get("supplier","") or ""))
+                update_product(pid,str(row_get(product,"name","") or ""),float(before.get("sell_price",0) or 0),target,int(row_get(product,"low_stock_level",0) or 0),str(row_get(product,"location","") or ""),str(row_get(product,"category","") or ""),str(row_get(product,"brand","") or ""))
+            reverse_after={"stock_qty":target,"cost_price":before.get("cost_price"),"sell_price":before.get("sell_price")}
+        elif kind=="LIFECYCLE":
+            current=get_product_lifecycle(self.db_path,row.get("barcode",""))
+            if current!=str(after.get("lifecycle",current)): messagebox.showerror("Reverse Action","The optional product type changed again. Reversal was blocked."); return
+            set_product_lifecycle(self.db_path,row.get("barcode",""),str(before.get("lifecycle","") or "")); reverse_after={"lifecycle":before.get("lifecycle","")}
+        elif kind in {"CLEARANCE","AI_set_sale_percent","AI_set_sale_price","AI_remove_sale"}:
+            bc=row.get("barcode",""); current=(get_seasonal_sales_map() or {}).get(bc)
+            if not self._offers_equal(current,after.get("offer")): messagebox.showerror("Reverse Action","The offer changed again after this action. Reversal was blocked."); return
+            old=before.get("offer")
+            if not old: remove_seasonal_sale_item(bc)
+            elif old.get("type")=="price": set_seasonal_sale_price_item(bc,float(old.get("price",0)))
+            else: set_seasonal_sale_item(bc,float(old.get("pct",0)))
+            reverse_after={"offer":old}
+        elif kind in {"AI_set_bundle","AI_remove_bundle"}:
+            bc=row.get("barcode",""); current=(get_bundle_offers_map() or {}).get(bc)
+            if not self._offers_equal(current,after.get("offer")): messagebox.showerror("Reverse Action","The bundle changed again after this action. Reversal was blocked."); return
+            old=before.get("offer")
+            if not old: remove_bundle_offer_item(bc)
+            else: set_bundle_offer_item(bc,int(old.get("qty",0)),float(old.get("price",0)))
+            reverse_after={"offer":old}
+        elif kind in {"AI_update_product","PRODUCT_UPDATE"}:
+            if not product: messagebox.showerror("Reverse Action","Product no longer exists."); return
+            keys=("name","sell_price","stock_qty","low_stock_level","location","category","brand","cost_price","supplier")
+            current={key:row_get(product,key) for key in keys}
+            def normalized(value):
+                if isinstance(value,(int,float)): return round(float(value),4)
+                return str(value or "")
+            if any(normalized(current.get(key))!=normalized(after.get(key)) for key in keys):
+                messagebox.showerror("Reverse Action","The product changed again after this action. Reversal was blocked to protect newer work."); return
+            pid=int(row_get(product,"id",0))
+            update_product(pid,str(before.get("name","") or ""),float(before.get("sell_price",0) or 0),int(before.get("stock_qty",0) or 0),int(before.get("low_stock_level",0) or 0),str(before.get("location","") or ""),str(before.get("category","") or ""),str(before.get("brand","") or ""))
+            update_product_details(pid,float(before.get("cost_price",0) or 0),str(before.get("supplier","") or ""))
+            reverse_after=dict(before)
+        elif kind=="PRODUCT_DETAILS":
+            if not product: messagebox.showerror("Reverse Action","Product no longer exists."); return
+            current_cost=round(float(row_get(product,"cost_price",0) or 0),4)
+            current_supplier=str(row_get(product,"supplier","") or "")
+            if current_cost!=round(float(after.get("cost_price",0) or 0),4) or current_supplier!=str(after.get("supplier","") or ""):
+                messagebox.showerror("Reverse Action","Cost or supplier changed again after this action. Reversal was blocked."); return
+            update_product_details(int(row_get(product,"id",0)),float(before.get("cost_price",0) or 0),str(before.get("supplier","") or ""))
+            reverse_after=dict(before)
+        elif kind=="SALE_PAYMENT":
+            sale_id=int(after.get("sale_id") or before.get("sale_id") or 0)
+            sale,_items=get_sale_detail(sale_id)
+            if not sale: messagebox.showerror("Reverse Action","Sale no longer exists."); return
+            current_method=str(row_get(sale,"payment_method","") or "").strip().upper()
+            current_cash=round(float(row_get(sale,"cash_paid",0) or 0),2)
+            expected_method=str(after.get("payment_method","") or "").strip().upper()
+            expected_cash=round(float(after.get("cash_paid",0) or 0),2)
+            if current_method!=expected_method or current_cash!=expected_cash:
+                messagebox.showerror("Reverse Action","The sale payment changed again after this correction. Reversal was blocked to protect the newer change."); return
+            result=update_sale_payment_split(
+                sale_id,
+                float(before.get("cash_paid",0) or 0),
+                float(before.get("whish_paid",0) or 0),
+                float(before.get("card_paid",0) or 0),
+                f"Reverse action #{row['id']}",
+                self._actor(),
+            ) or {}
+            reverse_after={
+                "sale_id":sale_id,
+                "payment_method":result.get("new_payment_method") or before.get("payment_method"),
+                "cash_paid":result.get("new_cash_paid",before.get("cash_paid",0)),
+                "whish_paid":result.get("new_whish_paid",before.get("whish_paid",0)),
+                "card_paid":result.get("new_card_paid",before.get("card_paid",0)),
+            }
+        elif kind=="CASH_MOVEMENT":
+            reversal_movement_id=int(after.get("movement_id") or 0)
+            if reversal_movement_id<=0:
+                messagebox.showerror("Reverse Action","The reversal movement could not be identified."); return
+            result=reverse_cash_movement(reversal_movement_id,f"Reverse action #{row['id']}",self._actor()) or {}
+            reverse_after={
+                "movement_id":int(result.get("reversal_movement_id") or 0),
+                "reversed_movement_id":reversal_movement_id,
+                "movement_type":result.get("new_movement_type"),
+                "amount_value":result.get("amount_value"),
+                "shift_id":result.get("shift_id"),
+            }
+        else:
+            messagebox.showinfo("Reverse Action","This action is retained for history but is not safely reversible."); return
+        reversal_id=record_inventory_action(self.db_path,action_type="REVERSAL",product_id=row.get("product_id"),barcode=row.get("barcode",""),product_name=row.get("product_name",""),description=f"Reversed action #{row['id']}: {row.get('description','')}",before=after,after=reverse_after,actor=self._actor())
+        mark_inventory_action_reversed(self.db_path,int(row["id"]),reversal_id); self.refresh_all(); messagebox.showinfo("Reverse Action","Action reversed safely. The original history was preserved.")
+
+    def _open_selected_history(self):
+        row=self._selected_metric()
+        if not row: messagebox.showinfo("History","Select a product first."); return
+        win=tk.Toplevel(self); win.title(f"Product History - {row.get('name','')}"); win.geometry("900x560"); win.configure(bg=UI.CONTENT_BG)
+        card=Card(win,padx=14,pady=14); card.pack(fill="both",expand=True,padx=12,pady=12)
+        HeaderBar(card.inner,str(row.get("name","Product")),f"Barcode {row.get('barcode','')} | unified stock and action history").pack(fill="x")
+        cols=("time","source","change","before","after","reason")
+        tree=ttk.Treeview(card.inner,columns=cols,show="headings",height=18)
+        for col,title,width in (("time","Time",150),("source","Type",120),("change","Change",70),("before","Before",70),("after","After",70),("reason","Reason",350)):
+            tree.heading(col,text=title); tree.column(col,width=width,anchor="w")
+        events=[]
+        for movement in list_inventory_movements(int(row.get("id") or 0),1000) or []:
+            events.append((str(row_get(movement,"created_at","")),str(row_get(movement,"movement_type","")),row_get(movement,"qty_change",""),row_get(movement,"qty_before",""),row_get(movement,"qty_after",""),str(row_get(movement,"reason",""))))
+        for action in list_inventory_actions(self.db_path,str(row.get("barcode") or ""),1000):
+            events.append((str(action.get("created_at","")),str(action.get("action_type","")),"","","",f"{action.get('status')}: {action.get('description','')}"))
+        for event in sorted(events,key=lambda x:x[0],reverse=True): tree.insert("",tk.END,values=event)
+        tree.pack(fill="both",expand=True,pady=(10,0))
+        buttons=tk.Frame(card.inner,bg=UI.CARD); buttons.pack(fill="x",pady=(10,0))
+        GhostButton(buttons,"Sales",lambda:open_product_sales_history_window(win,int(row.get("id") or 0),str(row.get("name") or ""))).pack(side="left")
+        GhostButton(buttons,"Price Changes",lambda:open_product_price_history_window(win,int(row.get("id") or 0),str(row.get("name") or ""))).pack(side="left",padx=6)
+        GhostButton(buttons,"Close",win.destroy).pack(side="right")
+
+
 class ProductsPage(tk.Frame):
     def __init__(self, parent, on_product_added):
         super().__init__(parent, bg=UI.CONTENT_BG)
@@ -6394,7 +6852,17 @@ class ProductsPage(tk.Frame):
                 messagebox.showerror("Invalid", "Cost price must be a number.", parent=win)
                 return
             try:
+                before_cost = float(row_get(product, "cost_price", 0) or 0)
+                before_supplier = str(row_get(product, "supplier", "") or "")
                 update_product_details(self.selected_product_id, cost, supplier_var.get().strip())
+                record_inventory_action(
+                    data_path("pos.db"), action_type="PRODUCT_DETAILS",
+                    product_id=self.selected_product_id, barcode=str(row_get(product, "barcode", "") or ""),
+                    product_name=str(row_get(product, "name", "") or ""),
+                    description="Updated optional cost/supplier details",
+                    before={"cost_price": before_cost, "supplier": before_supplier},
+                    after={"cost_price": cost, "supplier": supplier_var.get().strip()}, actor="Manager",
+                )
                 self.refresh_list()
                 if str(self.selected_product_id) in self.prod_tree.get_children():
                     self.prod_tree.selection_set(str(self.selected_product_id))
@@ -6457,7 +6925,15 @@ class ProductsPage(tk.Frame):
             messagebox.showerror("Invalid", "Check name, price, stock, location, low values.")
             return
 
+        old = dict(getattr(self, "_product_rows_by_id", {}).get(self.selected_product_id, {}) or {})
+        before = {key: row_get(old, key) for key in ("name", "sell_price", "stock_qty", "low_stock_level", "location", "category", "brand", "cost_price", "supplier")}
         update_product(self.selected_product_id, name, price, stock, low, location, category, brand)
+        after = dict(before); after.update({"name": name, "sell_price": price, "stock_qty": stock, "low_stock_level": low, "location": location, "category": category, "brand": brand})
+        record_inventory_action(
+            data_path("pos.db"), action_type="PRODUCT_UPDATE", product_id=self.selected_product_id,
+            barcode=str(row_get(old, "barcode", "") or self.selected_barcode), product_name=name,
+            description="Manual product edit", before=before, after=after, actor="Manager",
+        )
         messagebox.showinfo("Saved", "Product updated.")
         self.refresh_list()
 
@@ -7141,6 +7617,7 @@ class AIAssistantPage(tk.Frame):
         text_box.configure(yscrollcommand=scroll.set)
         text_box.pack(side="left", fill="both", expand=True, padx=(12, 0), pady=12)
         scroll.pack(side="right", fill="y", padx=(0, 12), pady=12)
+        text_box.insert("end", "Safe reversals are available in Inventory Tools > Action History / Reverse.\n\n")
         if not records:
             text_box.insert("end", "No AI actions have been proposed yet.")
         else:
@@ -7220,9 +7697,25 @@ class AIAssistantPage(tk.Frame):
                     pass
                 return
         try:
+            reversible_before = capture_action_state(action) if action_requires_manager(action) else {}
             message = execute_approved_action(
                 action, db_path=data_path("pos.db"), reports_folder=data_path("reports"),
             )
+            if reversible_before:
+                try:
+                    reversible_after = capture_action_state(action)
+                    args = dict(action.get("args") or {})
+                    barcode = str(args.get("barcode") or "")
+                    product = find_product_by_barcode(barcode) if barcode else None
+                    record_inventory_action(
+                        data_path("pos.db"), action_type=f"AI_{action.get('name', '')}",
+                        product_id=row_get(product, "id", None) if product else None,
+                        barcode=barcode, product_name=str(row_get(product, "name", "") or "") if product else "",
+                        description=details.replace("\n", " | "), before=reversible_before,
+                        after=reversible_after, actor=actor,
+                    )
+                except Exception:
+                    pass
             self.status_var.set(message); self._append("Mask POS", message)
             self._history.append({"role": "assistant", "content": f"Action result: {message}"})
             try:
@@ -8906,7 +9399,7 @@ class ShiftsPage(tk.Frame):
         ent.pack(side="left", padx=8)
         PrimaryButton(rep, "Reprint Receipt", self.reprint_receipt_clicked).pack(side="left")
         GhostButton(rep, "Gift Receipt", self.reprint_gift_receipt_clicked).pack(side="left", padx=(8, 0))
-        GhostButton(rep, "View Details", self.view_details_clicked).pack(side="left", padx=8)
+        GhostButton(rep, "View / Correct Sale", self.view_details_clicked).pack(side="left", padx=8)
         GhostButton(rep, "Find", self.lookup_sale_clicked).pack(side="left")
         GhostButton(rep, "Search All", self.open_sales_search).pack(side="left", padx=(8, 0))
         ent.bind("<Return>", lambda e: self.lookup_sale_clicked())
@@ -9016,9 +9509,40 @@ class ShiftsPage(tk.Frame):
         for key in getattr(self, "drawer_metric_labels", {}).keys():
             self._set_drawer_metric(key, "-")
         try:
-            self.drawer_now_value_lbl.config(text="-")
-            self.drawer_opening_lbl.config(text="")
-            self.drawer_now_sub_lbl.config(text="")
+            last_closed = get_last_closed_shift() or {}
+            if last_closed:
+                closing_value = float(row_get(last_closed, "closing_cash", 0.0) or 0.0)
+                closing_usd = float(row_get(last_closed, "closing_usd", closing_value) or 0.0)
+                closing_lbp = float(row_get(last_closed, "closing_lbp", 0.0) or 0.0)
+                closed_at = str(row_get(last_closed, "closed_at", "") or "").strip()
+                employee = str(row_get(last_closed, "employee_name", "") or "").strip()
+                shift_label = str(
+                    row_get(last_closed, "shift_code", "")
+                    or row_get(last_closed, "shift_seq", "")
+                    or row_get(last_closed, "id", "")
+                    or ""
+                ).strip()
+                self.drawer_now_value_lbl.config(text=drawer_money(closing_value))
+                self.drawer_opening_lbl.config(
+                    text=f"Left after last close: {drawer_money(closing_usd)} + {lbp_money(closing_lbp)}"
+                )
+                detail_bits = []
+                if shift_label:
+                    detail_bits.append(f"shift {shift_label}")
+                if closed_at:
+                    detail_bits.append(closed_at)
+                if employee:
+                    detail_bits.append(employee)
+                self.drawer_now_sub_lbl.config(
+                    text=(
+                        "No register is open. This is the amount left for the next opening"
+                        + (f" ({' | '.join(detail_bits)})." if detail_bits else ".")
+                    )
+                )
+            else:
+                self.drawer_now_value_lbl.config(text="-")
+                self.drawer_opening_lbl.config(text="")
+                self.drawer_now_sub_lbl.config(text="No previous closed register found.")
         except Exception:
             pass
         try:
@@ -10566,7 +11090,7 @@ class ShiftsPage(tk.Frame):
             text=(
                 f"Sales total: {money(displayed_sales_sum)}   |   Cash collected: {money(net_total_sum)}   |   Active sales: {sum(1 for r in rows if not bool(int(row_get(r, 'is_voided', 0) or 0)))}\n"
                 f"Cash in: {money(cash_in_sum)}   |   Cash out: {money(cash_out_sum)}\n"
-                f"Drawer net: {money(net_total_sum + cash_in_sum - cash_out_sum)}   |   "
+                f"Cash movement (sales + in - out): {money(net_total_sum + cash_in_sum - cash_out_sum)}   |   "
                 f"Cash in register: {money(cash_in_register)}"
             )
         )
@@ -10712,7 +11236,203 @@ class ShiftsPage(tk.Frame):
 
         btns = tk.Frame(box.inner, bg=UI.CARD)
         btns.pack(fill="x", pady=(12, 0))
+        if not bool(int(row_get(sale, "is_voided", 0) or 0)):
+            PrimaryButton(
+                btns,
+                "Correct Payment Method",
+                lambda: self._correct_sale_payment(win, sale, receipt_code),
+            ).pack(side="left")
         GhostButton(btns, "Close", win.destroy).pack(side="right")
+
+    def _correct_sale_payment(self, detail_win, sale, receipt_code):
+        current = str(row_get(sale, "payment_method", "CASH") or "CASH").strip().upper()
+        if current in ("EXCHANGE", "STORE_CREDIT"):
+            messagebox.showinfo(
+                "Payment correction",
+                "Store-credit and exchange sales cannot be changed with this tool.",
+                parent=detail_win,
+            )
+            return
+
+        win = tk.Toplevel(detail_win)
+        win.title(f"Correct Payment - Sale {receipt_code}")
+        win.geometry("540x460")
+        win.configure(bg=UI.CONTENT_BG)
+        win.transient(detail_win)
+        win.grab_set()
+        card = Card(win, padx=16, pady=16)
+        card.pack(fill="both", expand=True, padx=14, pady=14)
+        HeaderBar(
+            card.inner,
+            f"Sale {receipt_code}",
+            "Correct the tender only. Products, stock, price, and receipt total stay unchanged.",
+        ).pack(fill="x")
+        tk.Label(card.inner, text=f"Currently recorded as: {payment_method_label(current)}",
+                 bg=UI.CARD, fg=UI.TEXT, font=UI.FONT_MD).pack(anchor="w", pady=(12, 6))
+
+        amount_due = round(float(row_get(sale, "total_sales", 0) or row_get(sale, "total_amount", 0) or 0) - float(row_get(sale, "store_credit_used", 0) or 0), 2)
+        amount_due = max(0.0, amount_due)
+        current_cash = round(float(row_get(sale, "cash_paid", 0.0) or 0.0), 2)
+
+        def note_amount(key, default=0.0):
+            notes = str(row_get(sale, "notes", "") or "")
+            for part in notes.replace(";", "|").split("|"):
+                token = part.strip()
+                if token.upper().startswith(f"{key}="):
+                    try:
+                        return round(max(0.0, float(token.split("=", 1)[1] or 0.0)), 2)
+                    except Exception:
+                        return round(float(default or 0.0), 2)
+            return round(float(default or 0.0), 2)
+
+        cash_var = tk.StringVar(value=f"{current_cash:.2f}" if current_cash else "")
+        whish_var = tk.StringVar(value="")
+        card_var = tk.StringVar(value="")
+        if current not in ("CASH", "CASH+WHISH", "CASH+CARD", "CASH+CREDIT_CARD", "CASH+WHISH+CARD"):
+            cash_var.set("")
+        if "WHISH" in current:
+            whish_var.set(f"{note_amount('PAYMENT_WHISH', amount_due - current_cash):.2f}")
+        if "CARD" in current or "CREDIT_CARD" in current:
+            card_var.set(f"{note_amount('PAYMENT_CARD', amount_due - current_cash):.2f}")
+        if current == "WHISH":
+            whish_var.set(f"{amount_due:.2f}")
+        elif current in ("CARD", "CREDIT_CARD", "DEBIT"):
+            card_var.set(f"{amount_due:.2f}")
+
+        tk.Label(card.inner, text=f"Receipt total to assign: {money(amount_due)}",
+                 bg=UI.CARD, fg=UI.MUTED).pack(anchor="w", pady=(0, 8))
+
+        split_grid = tk.Frame(card.inner, bg=UI.CARD)
+        split_grid.pack(fill="x", pady=(0, 8))
+        split_grid.grid_columnconfigure(1, weight=1)
+        for idx, (label, var) in enumerate((("Cash", cash_var), ("Whish", whish_var), ("Card", card_var))):
+            tk.Label(split_grid, text=label, bg=UI.CARD, fg=UI.TEXT, width=10, anchor="w").grid(row=idx, column=0, sticky="w", pady=3)
+            tk.Entry(split_grid, textvariable=var, bd=1, relief="solid", justify="right").grid(row=idx, column=1, sticky="ew", pady=3)
+
+        def set_full(method):
+            cash_var.set(f"{amount_due:.2f}" if method == "CASH" else "")
+            whish_var.set(f"{amount_due:.2f}" if method == "WHISH" else "")
+            card_var.set(f"{amount_due:.2f}" if method == "CARD" else "")
+
+        quick = tk.Frame(card.inner, bg=UI.CARD)
+        quick.pack(fill="x", pady=(0, 8))
+        GhostButton(quick, "All Cash", lambda: set_full("CASH")).pack(side="left")
+        GhostButton(quick, "All Whish", lambda: set_full("WHISH")).pack(side="left", padx=(8, 0))
+        GhostButton(quick, "All Card", lambda: set_full("CARD")).pack(side="left", padx=(8, 0))
+
+        status_var = tk.StringVar(value="")
+        tk.Label(card.inner, textvariable=status_var, bg=UI.CARD, fg=UI.MUTED).pack(anchor="w")
+
+        def parse_split():
+            vals = []
+            for var in (cash_var, whish_var, card_var):
+                raw = str(var.get() or "").strip()
+                vals.append(round(max(0.0, float(raw or 0.0)), 2))
+            return vals
+
+        def update_split_status(*_):
+            try:
+                cash_amt, whish_amt, card_amt = parse_split()
+                total = round(cash_amt + whish_amt + card_amt, 2)
+                status_var.set(f"Assigned: {money(total)}  |  Difference: {money(total - amount_due)}")
+            except Exception:
+                status_var.set("Enter valid numbers only.")
+
+        for var in (cash_var, whish_var, card_var):
+            var.trace_add("write", update_split_status)
+        update_split_status()
+
+        tk.Label(card.inner, text="Reason", bg=UI.CARD, fg=UI.TEXT).pack(anchor="w", pady=(12, 4))
+        reason_var = tk.StringVar(value="Wrong payment method selected at checkout")
+        tk.Entry(card.inner, textvariable=reason_var, width=58, bd=1, relief="solid").pack(fill="x", ipady=4)
+        tk.Label(
+            card.inner,
+            text="Manager approval is required. The correction is audited and can be reversed from Inventory Tools.",
+            bg=UI.CARD, fg=UI.MUTED, justify="left", wraplength=440,
+        ).pack(anchor="w", pady=(10, 8))
+
+        def apply_correction():
+            reason = reason_var.get().strip()
+            try:
+                cash_amt, whish_amt, card_amt = parse_split()
+            except Exception:
+                messagebox.showerror("Payment correction", "Enter valid payment amounts.", parent=win)
+                return
+            if abs(round(cash_amt + whish_amt + card_amt, 2) - amount_due) > 0.01:
+                messagebox.showerror("Payment correction", f"The split must total {money(amount_due)}.", parent=win)
+                return
+            new_method = "+".join([name for name, amount in (("CASH", cash_amt), ("WHISH", whish_amt), ("CARD", card_amt)) if amount > 0.005]) or "CASH"
+            if new_method == current and round(cash_amt, 2) == round(current_cash, 2):
+                messagebox.showinfo("Payment correction", "Enter a different payment split.", parent=win)
+                return
+            if not reason:
+                messagebox.showerror("Payment correction", "Enter a reason.", parent=win)
+                return
+            password = simpledialog.askstring(
+                "Manager authorization",
+                "Enter the manager password:",
+                show="*",
+                parent=win,
+            )
+            if password is None or not verify_mode_admin_password(password):
+                messagebox.showerror("Denied", "Manager authorization failed.", parent=win)
+                return
+            actor = self.employee_var.get().strip() or "Manager"
+            sale_id = int(row_get(sale, "id", 0) or 0)
+            try:
+                result = update_sale_payment_split(sale_id, cash_amt, whish_amt, card_amt, reason, actor) or {}
+            except Exception as exc:
+                messagebox.showerror("Payment correction", str(exc), parent=win)
+                return
+            before = {
+                "sale_id": sale_id,
+                "payment_method": str(result.get("old_payment_method") or current),
+                "cash_paid": float(result.get("old_cash_paid", row_get(sale, "cash_paid", 0.0)) or 0.0),
+                "whish_paid": float(result.get("old_whish_paid", 0.0) or 0.0),
+                "card_paid": float(result.get("old_card_paid", 0.0) or 0.0),
+            }
+            after = {
+                "sale_id": sale_id,
+                "payment_method": str(result.get("new_payment_method") or new_method),
+                "cash_paid": float(result.get("new_cash_paid", 0.0) or 0.0),
+                "whish_paid": float(result.get("new_whish_paid", whish_amt) or 0.0),
+                "card_paid": float(result.get("new_card_paid", card_amt) or 0.0),
+            }
+            record_inventory_action(
+                data_path("pos.db"),
+                action_type="SALE_PAYMENT",
+                product_name=f"Sale {receipt_code}",
+                description=f"Payment corrected {current} -> {after['payment_method']}: {reason}",
+                before=before,
+                after=after,
+                actor=actor,
+            )
+            win.destroy()
+            detail_win.destroy()
+            self.load_day(silent=True)
+            self.refresh_all()
+            top = self.winfo_toplevel()
+            try:
+                if getattr(top, "shift_history_page", None):
+                    top.shift_history_page.load_day()
+            except Exception:
+                pass
+            variance_after = result.get("shift_variance_after")
+            variance_text = (
+                f"\nThe recorded closing difference is now {drawer_money(variance_after)}."
+                if variance_after is not None else ""
+            )
+            messagebox.showinfo(
+                "Payment corrected",
+                f"Sale {receipt_code} changed from {payment_method_label(current)} to {payment_method_label(after['payment_method'])}."
+                f"{variance_text}\nThis can be reversed from Inventory Tools > Action History / Reverse.",
+                parent=self,
+            )
+
+        buttons = tk.Frame(card.inner, bg=UI.CARD)
+        buttons.pack(fill="x", pady=(10, 0))
+        PrimaryButton(buttons, "Apply Correction", apply_correction).pack(side="left")
+        GhostButton(buttons, "Cancel", win.destroy).pack(side="right")
 
     def open_cash_movement_detail(self, iid: str):
         try:
@@ -10763,7 +11483,99 @@ class ShiftsPage(tk.Frame):
 
         btns = tk.Frame(box.inner, bg=UI.CARD)
         btns.pack(fill="x", pady=(14, 0))
+        movement_notes = str(row_get(movement, "notes", "") or "")
+        if "REVERSAL_OF=" not in movement_notes:
+            DangerButton(
+                btns,
+                "Reverse Movement",
+                lambda: self._reverse_cash_movement_dialog(win, movement),
+            ).pack(side="left")
         GhostButton(btns, "Close", win.destroy).pack(side="right")
+
+    def _reverse_cash_movement_dialog(self, detail_win, movement):
+        movement_id = int(row_get(movement, "id", 0) or 0)
+        if movement_id <= 0:
+            return
+        mtype = str(row_get(movement, "movement_type", "OUT") or "OUT").upper()
+        amount_value = round(float(row_get(movement, "amount_value", 0.0) or 0.0), 2)
+        reverse_type = "IN" if mtype == "OUT" else "OUT"
+        reason = simpledialog.askstring(
+            "Reverse cash movement",
+            (
+                f"Reverse Cash {'In' if mtype == 'IN' else 'Out'} #{movement_id} for {drawer_money(amount_value)}?\n\n"
+                f"This will create a Cash {'In' if reverse_type == 'IN' else 'Out'} correction.\n"
+                "Enter the reason:"
+            ),
+            initialvalue="Wrong cash movement recorded",
+            parent=detail_win,
+        )
+        if reason is None:
+            return
+        reason = reason.strip()
+        if not reason:
+            messagebox.showerror("Reverse cash movement", "A reason is required.", parent=detail_win)
+            return
+        password = simpledialog.askstring(
+            "Manager authorization",
+            "Enter the manager password:",
+            show="*",
+            parent=detail_win,
+        )
+        if password is None or not verify_mode_admin_password(password):
+            messagebox.showerror("Denied", "Manager authorization failed.", parent=detail_win)
+            return
+        actor = self.employee_var.get().strip() or "Manager"
+        before = {
+            "movement_id": movement_id,
+            "movement_type": mtype,
+            "amount_usd": float(row_get(movement, "amount_usd", 0.0) or 0.0),
+            "amount_lbp": float(row_get(movement, "amount_lbp", 0.0) or 0.0),
+            "amount_value": amount_value,
+            "shift_id": int(row_get(movement, "shift_id", 0) or 0),
+        }
+        try:
+            result = reverse_cash_movement(movement_id, reason, actor) or {}
+        except Exception as exc:
+            messagebox.showerror("Reverse cash movement", str(exc), parent=detail_win)
+            return
+        after = {
+            "movement_id": int(result.get("reversal_movement_id") or 0),
+            "reversed_movement_id": movement_id,
+            "movement_type": str(result.get("new_movement_type") or reverse_type),
+            "amount_usd": float(result.get("amount_usd", before["amount_usd"]) or 0.0),
+            "amount_lbp": float(result.get("amount_lbp", before["amount_lbp"]) or 0.0),
+            "amount_value": float(result.get("amount_value", amount_value) or 0.0),
+            "shift_id": int(result.get("shift_id", before["shift_id"]) or 0),
+        }
+        record_inventory_action(
+            data_path("pos.db"),
+            action_type="CASH_MOVEMENT",
+            product_name=f"Cash movement #{movement_id}",
+            description=f"Reversed cash movement #{movement_id}: {reason}",
+            before=before,
+            after=after,
+            actor=actor,
+        )
+        detail_win.destroy()
+        self.load_day(silent=True)
+        self.refresh_all()
+        try:
+            top = self.winfo_toplevel()
+            if getattr(top, "shift_history_page", None):
+                top.shift_history_page.load_day()
+        except Exception:
+            pass
+        variance_after = result.get("shift_variance_after")
+        variance_text = (
+            f"\nThe recorded closing difference is now {drawer_money(variance_after)}."
+            if variance_after is not None else ""
+        )
+        messagebox.showinfo(
+            "Cash movement reversed",
+            f"Created movement #{after['movement_id']} to reverse #{movement_id}.{variance_text}\n"
+            "This is also listed in Inventory Tools > Action History / Reverse.",
+            parent=self,
+        )
 
     # ---------------- RETURNS / EXCHANGE PAGE ----------------
 
@@ -10960,11 +11772,17 @@ class ShiftHistoryPage(tk.Frame):
     def __init__(self, parent):
         super().__init__(parent, bg=UI.CONTENT_BG)
         today = datetime.now()
-        self.sales_year = tk.StringVar(value=str(today.year))
-        self.sales_month = tk.StringVar(value=f"{today.month:02d}")
-        self.sales_day = tk.StringVar(value=f"{today.day:02d}")
+        self.date_var = tk.StringVar(value=today.strftime("%Y-%m-%d"))
         self.summary_var = tk.StringVar(value="")
+        self.closed_left_var = tk.StringVar(value="")
+        self.load_status_var = tk.StringVar(value="")
+        self._load_generation = 0
+        self._loaded_rows = {}
+        self._last_day_payload = None
+        self._last_day = ""
+        self._load_results = queue.Queue()
         self._build()
+        self.after(50, self._poll_load_results)
 
     def _build(self):
         scroll = VScrollableFrame(self, bg=UI.CONTENT_BG)
@@ -10986,30 +11804,43 @@ class ShiftHistoryPage(tk.Frame):
         top = tk.Frame(body.inner, bg=UI.CARD)
         top.pack(fill="x", pady=(0, 10))
         tk.Label(top, text="Date", bg=UI.CARD, fg="#334155").pack(side="left")
-        years = [str(y) for y in range(datetime.now().year - 5, datetime.now().year + 1)]
-        months = [f"{m:02d}" for m in range(1, 13)]
-        days = [f"{d:02d}" for d in range(1, 32)]
-        ttk.Combobox(top, textvariable=self.sales_year, values=years, width=6, state="readonly").pack(side="left",
-                                                                                                      padx=(8, 6))
-        ttk.Combobox(top, textvariable=self.sales_month, values=months, width=4, state="readonly").pack(side="left",
-                                                                                                        padx=(0, 6))
-        ttk.Combobox(top, textvariable=self.sales_day, values=days, width=4, state="readonly").pack(side="left",
-                                                                                                    padx=(0, 10))
+        self.date_entry = tk.Entry(top, textvariable=self.date_var, width=12, font=UI.FONT_SM,
+                                   justify="center", bd=1, relief="solid")
+        self.date_entry.pack(side="left", padx=(8, 10), ipady=4)
+        self.date_entry.bind("<Return>", lambda _e: self.load_day())
         GhostButton(top, "< Day", lambda: self.move_day(-1)).pack(side="left", padx=(0, 8))
         GhostButton(top, "Day >", lambda: self.move_day(1)).pack(side="left", padx=(0, 8))
         GhostButton(top, "Today", self.set_today).pack(side="left", padx=(0, 8))
-        PrimaryButton(top, "Load", self.load_day).pack(side="left")
+        self.load_btn = PrimaryButton(top, "Load", self.load_day)
+        self.load_btn.pack(side="left")
+        GhostButton(top, "Reconciliation", self._show_reconciliation_breakdown).pack(side="left", padx=(8, 0))
+        GhostButton(top, "Expand All", lambda: self._set_all_open(True)).pack(side="right", padx=(8, 0))
+        GhostButton(top, "Collapse All", lambda: self._set_all_open(False)).pack(side="right")
 
         tk.Label(body.inner, textvariable=self.summary_var, bg=UI.CARD, fg=UI.TEXT,
-                 font=("Segoe UI", 14, "bold")).pack(anchor="w", pady=(0, 10))
+                 font=("Segoe UI", 12 if UI.COMPACT else 14, "bold"), justify="left",
+                 wraplength=1220).pack(anchor="w", pady=(0, 4))
+        tk.Label(
+            body.inner,
+            textvariable=self.closed_left_var,
+            bg="#ecfeff",
+            fg="#155e75",
+            font=("Segoe UI", 13 if UI.COMPACT else 16, "bold"),
+            justify="left",
+            anchor="w",
+        ).pack(fill="x", pady=(0, 8), ipady=7, ipadx=10)
+        tk.Label(body.inner, textvariable=self.load_status_var, bg=UI.CARD, fg=UI.MUTED,
+                 font=UI.FONT_SM).pack(anchor="w", pady=(0, 10))
 
         cols = ("time", "employee", "opening", "closing", "sales", "diff", "status")
-        self.tree = ttk.Treeview(body.inner, columns=cols, show="tree headings", height=18)
+        tree_wrap = tk.Frame(body.inner, bg=UI.CARD)
+        tree_wrap.pack(fill="both", expand=True)
+        self.tree = ttk.Treeview(tree_wrap, columns=cols, show="tree headings", height=18)
         self.tree.heading("#0", text="Shift / Sale")
         self.tree.heading("time", text="Time")
         self.tree.heading("employee", text="Employee / Pay")
         self.tree.heading("opening", text="Opening")
-        self.tree.heading("closing", text="Closing")
+        self.tree.heading("closing", text="Left When Closed")
         self.tree.heading("sales", text="Sales")
         self.tree.heading("diff", text="Diff")
         self.tree.heading("status", text="Status")
@@ -11021,24 +11852,34 @@ class ShiftHistoryPage(tk.Frame):
         self.tree.column("sales", width=105, anchor="e")
         self.tree.column("diff", width=90, anchor="e")
         self.tree.column("status", width=80, anchor="center")
-        self.tree.pack(fill="both", expand=True)
-
-        scroll = ttk.Scrollbar(body.inner, orient="vertical", command=self.tree.yview)
-        self.tree.configure(yscrollcommand=scroll.set)
-        scroll.place(relx=1.0, rely=0.19, relheight=0.78, anchor="ne")
+        yscroll = ttk.Scrollbar(tree_wrap, orient="vertical", command=self.tree.yview)
+        xscroll = ttk.Scrollbar(tree_wrap, orient="horizontal", command=self.tree.xview)
+        self.tree.configure(yscrollcommand=yscroll.set, xscrollcommand=xscroll.set)
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        yscroll.grid(row=0, column=1, sticky="ns")
+        xscroll.grid(row=1, column=0, sticky="ew")
+        tree_wrap.grid_rowconfigure(0, weight=1)
+        tree_wrap.grid_columnconfigure(0, weight=1)
+        self.tree.bind("<Double-1>", self._show_selected_details)
+        try:
+            self.tree.tag_configure("open", background="#eff6ff", foreground="#1d4ed8")
+            self.tree.tag_configure("ok", background="#f0fdf4", foreground="#166534")
+            self.tree.tag_configure("check", background="#fff7ed", foreground="#9a3412")
+            self.tree.tag_configure("sale", foreground="#334155")
+            self.tree.tag_configure("movement", foreground="#7c3aed")
+            self.tree.tag_configure("unassigned", background="#fef2f2", foreground="#991b1b")
+        except Exception:
+            pass
 
         self.load_day()
 
     def _selected_day(self) -> str:
-        day = f"{self.sales_year.get()}-{self.sales_month.get()}-{self.sales_day.get()}"
-        datetime.strptime(day, "%Y-%m-%d")
-        return day
+        raw = str(self.date_var.get() or "").strip()
+        parsed = datetime.strptime(raw, "%Y-%m-%d").date()
+        return parsed.isoformat()
 
     def set_today(self):
-        today = datetime.now()
-        self.sales_year.set(str(today.year))
-        self.sales_month.set(f"{today.month:02d}")
-        self.sales_day.set(f"{today.day:02d}")
+        self.date_var.set(datetime.now().strftime("%Y-%m-%d"))
         self.load_day()
 
     def move_day(self, delta: int):
@@ -11046,10 +11887,83 @@ class ShiftHistoryPage(tk.Frame):
             dt = datetime.strptime(self._selected_day(), "%Y-%m-%d").date() + timedelta(days=int(delta))
         except Exception:
             dt = date.today()
-        self.sales_year.set(str(dt.year))
-        self.sales_month.set(f"{dt.month:02d}")
-        self.sales_day.set(f"{dt.day:02d}")
+        self.date_var.set(dt.isoformat())
         self.load_day()
+
+    def _set_all_open(self, is_open: bool):
+        for iid in self.tree.get_children(""):
+            self.tree.item(iid, open=bool(is_open))
+
+    def _show_selected_details(self, _event=None):
+        selected = self.tree.selection()
+        if not selected:
+            return
+        iid = selected[0]
+        details = self._loaded_rows.get(iid)
+        if not details:
+            return
+        lines = [str(details.get("title") or "Shift History")]
+        for label, value in details.get("fields", []):
+            lines.append(f"{label}: {value}")
+        messagebox.showinfo("Shift History Details", "\n".join(lines), parent=self)
+
+    def _show_reconciliation_breakdown(self):
+        payload = self._last_day_payload or {}
+        day = self._last_day or str(self.date_var.get() or "")
+        day_shifts = payload.get("day_shifts") or []
+        summaries = payload.get("summaries") or {}
+        sales_by_shift = payload.get("sales_by_shift") or {}
+        movements_by_shift = payload.get("movements_by_shift") or {}
+        if not payload:
+            messagebox.showinfo("Reconciliation", "Load a day first.", parent=self)
+            return
+        selected = self.tree.selection()
+        selected_shift_id = None
+        if selected:
+            iid = str(selected[0])
+            if iid.startswith("shift_"):
+                try:
+                    selected_shift_id = int(iid.split("_", 1)[1])
+                except Exception:
+                    selected_shift_id = None
+        lines = [f"Reconciliation for {day}"]
+        target_shifts = []
+        for sh in day_shifts:
+            sid = int(row_get(sh, "id", 0) or 0)
+            if selected_shift_id and sid != selected_shift_id:
+                continue
+            target_shifts.append(sh)
+        if selected_shift_id and not target_shifts:
+            messagebox.showinfo("Reconciliation", "Select a shift row, or clear selection for the full day.", parent=self)
+            return
+        for sh in target_shifts:
+            sid = int(row_get(sh, "id", 0) or 0)
+            summ = summaries.get(sid) or {}
+            opening = float(summ.get("opening_cash", row_get(sh, "opening_cash", 0)) or 0.0)
+            cash_sales = sum(self._sale_cash_amount(s) for s in sales_by_shift.get(sid, []))
+            cash_in = sum(float(row_get(m, "amount_value", 0.0) or 0.0) for m in movements_by_shift.get(sid, []) if str(row_get(m, "movement_type", "OUT") or "OUT").upper() == "IN")
+            cash_out = sum(float(row_get(m, "amount_value", 0.0) or 0.0) for m in movements_by_shift.get(sid, []) if str(row_get(m, "movement_type", "OUT") or "OUT").upper() == "OUT")
+            refunds = float(summ.get("cash_refunds", 0.0) or 0.0)
+            expected = round(opening + cash_sales + cash_in - cash_out - refunds, 2)
+            closing = row_get(sh, "closing_cash", None)
+            recorded_diff = self._recorded_close_variance(row_get(sh, "notes", ""))
+            diff = recorded_diff if closing is not None and recorded_diff is not None else (round(float(closing or 0.0) - expected, 2) if closing is not None else None)
+            label = str(row_get(sh, "shift_code", "") or sid).strip()
+            lines.extend([
+                "",
+                f"Shift #{label}",
+                f"Opening cash: {drawer_money(opening)}",
+                f"+ Cash sales: {drawer_money(cash_sales)}",
+                f"+ Cash in: {drawer_money(cash_in)}",
+                f"- Cash out: {drawer_money(cash_out)}",
+                f"- Cash refunds: {drawer_money(refunds)}",
+                f"= Expected cash: {drawer_money(expected)}",
+                f"Left/count at close: {drawer_money(closing) if closing is not None else 'Still open'}",
+                f"Recorded closing difference: {drawer_money(diff) if diff is not None else 'Not available'}",
+            ])
+        if not target_shifts:
+            lines.append("No shifts found for this day.")
+        messagebox.showinfo("Reconciliation Breakdown", "\n".join(lines), parent=self)
 
     def _parse_dt(self, value):
         try:
@@ -11064,6 +11978,11 @@ class ShiftHistoryPage(tk.Frame):
         right = cdt.strftime("%I:%M %p").lstrip("0") if cdt else "Open"
         return f"{left} - {right}"
 
+    @staticmethod
+    def _recorded_close_variance(notes):
+        matches = list(re.finditer(r"(?i)variance\s+\$?(-?[0-9]+(?:\.[0-9]+)?)", str(notes or "")))
+        return float(matches[-1].group(1)) if matches else None
+
     def _shift_matches_day(self, sh, day: str, sale_shift_ids: set[int]) -> bool:
         try:
             sid = int(row_get(sh, "id", 0) or 0)
@@ -11076,6 +11995,52 @@ class ShiftHistoryPage(tk.Frame):
             if value.startswith(day):
                 return True
         return False
+
+    def _hide_duplicate_shift_shells(self, shifts, sales_by_shift, movements_by_shift):
+        """Hide empty sync-created copies without changing or deleting history rows."""
+        grouped = {}
+        for sh in shifts:
+            sid = int(row_get(sh, "id", 0) or 0)
+            opened = str(row_get(sh, "opened_at", "") or "").strip()
+            employee_key = str(
+                row_get(sh, "employee_id", "")
+                or row_get(sh, "employee_name", "")
+                or ""
+            ).strip().casefold()
+            key = (opened, employee_key) if opened else (f"id:{sid}", employee_key)
+            grouped.setdefault(key, []).append(sh)
+
+        kept = []
+        hidden = 0
+        for group in grouped.values():
+            if len(group) == 1:
+                kept.extend(group)
+                continue
+
+            meaningful = []
+            for sh in group:
+                sid = int(row_get(sh, "id", 0) or 0)
+                sales_count = len(sales_by_shift.get(sid, []))
+                nonzero_movements = any(
+                    abs(float(row_get(m, "amount_value", 0.0) or 0.0)) >= 0.005
+                    for m in movements_by_shift.get(sid, [])
+                )
+                opening = abs(float(row_get(sh, "opening_cash", 0.0) or 0.0))
+                closing_value = row_get(sh, "closing_cash", None)
+                closing = abs(float(closing_value or 0.0)) if closing_value is not None else 0.0
+                if sales_count or nonzero_movements or opening >= 0.005 or closing >= 0.005:
+                    meaningful.append(sh)
+
+            if meaningful:
+                kept.extend(meaningful)
+                hidden += len(group) - len(meaningful)
+            else:
+                # Preserve one representative if every copy is an empty shift.
+                representative = min(group, key=lambda r: int(row_get(r, "id", 0) or 0))
+                kept.append(representative)
+                hidden += len(group) - 1
+
+        return kept, hidden
 
     def _sale_credit_used_amount(self, sale_row) -> float:
         for key in ("store_credit_used", "exchange_credit_used", "bon_credit_used"):
@@ -11131,18 +12096,45 @@ class ShiftHistoryPage(tk.Frame):
         try:
             day = self._selected_day()
         except Exception:
-            messagebox.showerror("Invalid", "Selected date is invalid.")
+            messagebox.showerror("Invalid date", "Enter a real date as YYYY-MM-DD.", parent=self)
+            try:
+                self.date_entry.focus_set()
+                self.date_entry.selection_range(0, tk.END)
+            except Exception:
+                pass
             return
 
+        self.date_var.set(day)
+        self._load_generation += 1
+        generation = self._load_generation
+        self.load_status_var.set(f"Loading {day}...")
         try:
-            self.tree.delete(*self.tree.get_children())
+            self.load_btn.config(state="disabled", text="Loading...")
         except Exception:
             pass
+        threading.Thread(
+            target=self._load_day_worker,
+            args=(day, generation),
+            daemon=True,
+        ).start()
 
+    def _load_day_worker(self, day: str, generation: int):
         try:
-            sales = list_sales_for_day(day, limit=2000) or []
-        except Exception:
-            sales = []
+            sales = list_sales_for_day(day, limit=5000) or []
+        except Exception as exc:
+            self._load_results.put((generation, day, None, f"Sales could not be loaded: {exc}"))
+            return
+        try:
+            movements = list_cash_movements(day_str=day, limit=5000) or []
+        except Exception as exc:
+            self._load_results.put((generation, day, None, f"Cash movements could not be loaded: {exc}"))
+            return
+        try:
+            shifts = list_shifts(limit=5000) or []
+        except Exception as exc:
+            self._load_results.put((generation, day, None, f"Shifts could not be loaded: {exc}"))
+            return
+
         sales_by_shift = {}
         movements_by_shift = {}
         unassigned_movements = []
@@ -11166,10 +12158,6 @@ class ShiftHistoryPage(tk.Frame):
             else:
                 unassigned.append(sale)
 
-        try:
-            movements = list_cash_movements(day_str=day, limit=2000) or []
-        except Exception:
-            movements = []
         for movement in movements:
             mtype = str(row_get(movement, "movement_type", "OUT") or "OUT").upper()
             if mtype not in ("IN", "OUT"):
@@ -11184,15 +12172,10 @@ class ShiftHistoryPage(tk.Frame):
             except Exception:
                 sid = 0
             if sid > 0:
-                sale_shift_ids.add(sid)
                 movements_by_shift.setdefault(sid, []).append(movement)
             else:
                 unassigned_movements.append(movement)
 
-        try:
-            shifts = list_shifts(limit=1000) or []
-        except Exception:
-            shifts = []
         day_shifts = []
         seen = set()
         for sh in shifts:
@@ -11207,17 +12190,95 @@ class ShiftHistoryPage(tk.Frame):
                 seen.add(sid)
 
         day_shifts.sort(key=lambda r: str(row_get(r, "opened_at", "") or ""))
+        day_shifts, hidden_duplicate_shifts = self._hide_duplicate_shift_shells(
+            day_shifts,
+            sales_by_shift,
+            movements_by_shift,
+        )
+        visible_shift_ids = {int(row_get(sh, "id", 0) or 0) for sh in day_shifts}
+        other_linked_movements = []
+        for sid in list(movements_by_shift):
+            if int(sid or 0) not in visible_shift_ids:
+                other_linked_movements.extend(movements_by_shift.pop(sid, []))
+
+        summaries = {}
+        summary_errors = []
+        for sh in day_shifts:
+            sid = int(row_get(sh, "id", 0) or 0)
+            try:
+                summaries[sid] = shift_summary(sid) or {}
+            except Exception as exc:
+                summaries[sid] = {}
+                summary_errors.append(f"shift {sid}: {exc}")
+
+        payload = {
+            "sales": sales,
+            "movements": movements,
+            "sales_by_shift": sales_by_shift,
+            "movements_by_shift": movements_by_shift,
+            "unassigned": unassigned,
+            "unassigned_movements": unassigned_movements,
+            "other_linked_movements": other_linked_movements,
+            "daily_sales_total": daily_sales_total,
+            "daily_cash_sales_total": daily_cash_sales_total,
+            "daily_cash_in_total": daily_cash_in_total,
+            "daily_cash_out_total": daily_cash_out_total,
+            "day_shifts": day_shifts,
+            "summaries": summaries,
+            "summary_errors": summary_errors,
+            "hidden_duplicate_shifts": hidden_duplicate_shifts,
+        }
+        self._load_results.put((generation, day, payload, None))
+
+    def _poll_load_results(self):
+        try:
+            while True:
+                generation, day, payload, error = self._load_results.get_nowait()
+                self._finish_day_load(generation, day, payload, error)
+        except queue.Empty:
+            pass
+        try:
+            self.after(50, self._poll_load_results)
+        except tk.TclError:
+            pass
+
+    def _finish_day_load(self, generation: int, day: str, payload, error):
+        if generation != self._load_generation:
+            return
+        try:
+            self.load_btn.config(state="normal", text="Load")
+        except Exception:
+            pass
+        if error:
+            self.load_status_var.set(str(error))
+            messagebox.showerror("Shift History", str(error), parent=self)
+            return
+        self._render_day(day, payload or {})
+
+    def _render_day(self, day: str, payload: dict):
+        self.tree.delete(*self.tree.get_children())
+        self._loaded_rows = {}
+        self._last_day = day
+        self._last_day_payload = payload or {}
+        sales = payload.get("sales") or []
+        sales_by_shift = payload.get("sales_by_shift") or {}
+        movements_by_shift = payload.get("movements_by_shift") or {}
+        unassigned = payload.get("unassigned") or []
+        unassigned_movements = payload.get("unassigned_movements") or []
+        other_linked_movements = payload.get("other_linked_movements") or []
+        day_shifts = payload.get("day_shifts") or []
+        summaries = payload.get("summaries") or {}
 
         day_opening_total = 0.0
         day_closing_total = 0.0
         closed_shift_count = 0
+        latest_closed_left = None
+        latest_closed_label = ""
+        latest_closed_at = ""
 
         for sh in day_shifts:
             sid = int(row_get(sh, "id", 0) or 0)
-            try:
-                summ = shift_summary(sid) or {}
-            except Exception:
-                summ = {}
+            summ = summaries.get(sid) or {}
 
             employee = str(row_get(sh, "employee_name", "") or "Unassigned")
             try:
@@ -11229,27 +12290,37 @@ class ShiftHistoryPage(tk.Frame):
             closing_raw = summ.get("closing_cash", row_get(sh, "closing_cash", None))
             if closing_raw is not None:
                 try:
-                    day_closing_total += float(closing_raw or 0.0)
+                    closing_value_float = float(closing_raw or 0.0)
+                    day_closing_total += closing_value_float
                     closed_shift_count += 1
+                    closed_at_text = str(row_get(sh, "closed_at", "") or "")
+                    if closed_at_text >= latest_closed_at:
+                        latest_closed_at = closed_at_text
+                        latest_closed_left = closing_value_float
+                        latest_closed_label = str(row_get(sh, "shift_code", "") or sid).strip()
                 except Exception:
                     pass
             closing = drawer_money(closing_raw) if closing_raw is not None else ""
             shift_sales = sum(self._sale_new_money_amount(s) for s in sales_by_shift.get(sid, []))
-            diff = summ.get("difference", None)
+            recorded_diff = self._recorded_close_variance(row_get(sh, "notes", ""))
+            diff = recorded_diff if closing_raw is not None and recorded_diff is not None else summ.get("difference", None)
             diff_text = drawer_money(diff) if diff is not None else ""
             status = "OPEN"
             if closing_raw is not None:
                 try:
-                    status = "OK" if abs(float(diff or 0.0)) < 0.5 else "CHECK"
+                    status = "OK" if abs(float(diff or 0.0)) <= 4.0 else "CHECK"
                 except Exception:
                     status = "CHECK"
 
             shift_lbl = str(row_get(sh, "shift_code", "") or sid).strip()
+            row_title = f"Shift #{shift_lbl}"
+            if closing_raw is not None:
+                row_title = f"{row_title} - Left {closing}"
             parent = self.tree.insert(
                 "",
                 tk.END,
                 iid=f"shift_{sid}",
-                text=f"Shift #{shift_lbl}",
+                text=row_title,
                 open=True,
                 values=(
                     self._time_range(row_get(sh, "opened_at", ""), row_get(sh, "closed_at", "")),
@@ -11259,8 +12330,27 @@ class ShiftHistoryPage(tk.Frame):
                     drawer_money(shift_sales),
                     diff_text,
                     status,
-                )
+                ),
+                tags=(status.lower(),),
             )
+            self._loaded_rows[parent] = {
+                "title": f"Shift #{shift_lbl}",
+                "fields": [
+                    ("Employee", employee),
+                    ("Opened", row_get(sh, "opened_at", "")),
+                    ("Closed", row_get(sh, "closed_at", "") or "Still open"),
+                    ("Opening cash", opening),
+                    ("Cash sales", drawer_money(summ.get("cash_sales", 0.0))),
+                    ("Cash in", drawer_money(summ.get("cash_in_value", 0.0))),
+                    ("Cash out", drawer_money(summ.get("cash_out_value", 0.0))),
+                    ("Calculated expected cash", drawer_money(summ.get("expected_cash", 0.0))),
+                    ("Left in register when closed", closing or "Not closed"),
+                    ("Recorded closing difference", diff_text or "Not available"),
+                    ("Orders", len(sales_by_shift.get(sid, []))),
+                    ("Opening notes", row_get(sh, "notes", "") or ""),
+                    ("Closing notes", row_get(sh, "closing_notes", "") or ""),
+                ],
+            }
 
             for sale in sales_by_shift.get(sid, []):
                 self._insert_sale_row(parent, sale)
@@ -11273,8 +12363,13 @@ class ShiftHistoryPage(tk.Frame):
                 tk.END,
                 text="Unassigned Sales",
                 open=True,
-                values=("", "", "", "", drawer_money(sum(self._sale_new_money_amount(s) for s in unassigned)), "", "CHECK")
+                values=("", "", "", "", drawer_money(sum(self._sale_new_money_amount(s) for s in unassigned)), "", "CHECK"),
+                tags=("unassigned",),
             )
+            self._loaded_rows[parent] = {
+                "title": "Unassigned Sales",
+                "fields": [("Sales", len(unassigned)), ("Meaning", "These sales are not linked to a shift.")],
+            }
             for sale in unassigned:
                 self._insert_sale_row(parent, sale)
 
@@ -11291,20 +12386,73 @@ class ShiftHistoryPage(tk.Frame):
                 tk.END,
                 text="Unassigned Cash Movements",
                 open=True,
-                values=("", "", "", "", drawer_money(unassigned_net), "", "CHECK")
+                values=("", "", "", "", drawer_money(unassigned_net), "", "CHECK"),
+                tags=("unassigned",),
             )
+            self._loaded_rows[parent] = {
+                "title": "Unassigned Cash Movements",
+                "fields": [("Entries", len(unassigned_movements)), ("Net amount", drawer_money(unassigned_net))],
+            }
             for movement in unassigned_movements:
                 self._insert_cash_movement_row(parent, movement)
 
-        closing_text = drawer_money(day_closing_total) if closed_shift_count > 0 else "Open"
+        if other_linked_movements:
+            other_net = 0.0
+            linked_shift_ids = set()
+            for movement in other_linked_movements:
+                amount = float(row_get(movement, "amount_value", 0.0) or 0.0)
+                if str(row_get(movement, "movement_type", "OUT") or "OUT").upper() == "IN":
+                    other_net += amount
+                else:
+                    other_net -= amount
+                linked_shift_ids.add(int(row_get(movement, "shift_id", 0) or 0))
+            parent = self.tree.insert(
+                "",
+                tk.END,
+                text="Other Linked Cash Movements",
+                open=True,
+                values=("", "", "", "", drawer_money(other_net), "", "REVIEW"),
+                tags=("check",),
+            )
+            self._loaded_rows[parent] = {
+                "title": "Other Linked Cash Movements",
+                "fields": [
+                    ("Entries", len(other_linked_movements)),
+                    ("Net amount", drawer_money(other_net)),
+                    ("Linked shift IDs", ", ".join(str(v) for v in sorted(linked_shift_ids))),
+                    ("Meaning", "These movements happened on this date but point to a shift recorded on another date."),
+                ],
+            }
+            for movement in other_linked_movements:
+                self._insert_cash_movement_row(parent, movement)
+
+        if not day_shifts and not sales and not unassigned_movements and not other_linked_movements:
+            self.tree.insert("", tk.END, text="No activity", values=("", "", "", "", "", "", ""))
+        closing_text = drawer_money(day_closing_total) if closed_shift_count > 0 else "No closed shift"
+        if latest_closed_left is not None:
+            self.closed_left_var.set(
+                f"LEFT IN REGISTER WHEN CLOSED: {drawer_money(latest_closed_left)}"
+                f"  |  Shift #{latest_closed_label or '?'}  |  {latest_closed_at or day}"
+            )
+        else:
+            self.closed_left_var.set("LEFT IN REGISTER WHEN CLOSED: No closed shift for this day")
         self.summary_var.set(
-            f"{day}  |  New money: {drawer_money(daily_sales_total)}  |  "
-            f"Cash sales: {drawer_money(daily_cash_sales_total)}  |  "
-            f"Cash in: {drawer_money(daily_cash_in_total)}  |  "
-            f"Cash out: {drawer_money(daily_cash_out_total)}  |  "
-            f"Day opening: {drawer_money(day_opening_total)}  |  Day closing: {closing_text}  |  "
-            f"Shifts: {len(day_shifts)}  |  Sales: {len(sales)}"
+            f"{day}  |  {len(day_shifts)} shift(s)  |  {len(sales)} sale(s)\n"
+            f"New money: {drawer_money(payload.get('daily_sales_total', 0.0))}  |  "
+            f"Cash sales: {drawer_money(payload.get('daily_cash_sales_total', 0.0))}  |  "
+            f"Cash in: {drawer_money(payload.get('daily_cash_in_total', 0.0))}  |  "
+            f"Cash out: {drawer_money(payload.get('daily_cash_out_total', 0.0))}\n"
+            f"Opening checks total: {drawer_money(day_opening_total)}  |  Left in register total: {closing_text}"
         )
+        warnings = payload.get("summary_errors") or []
+        hidden = int(payload.get("hidden_duplicate_shifts", 0) or 0)
+        notices = []
+        if hidden:
+            notices.append(f"{hidden} empty duplicate shift shell(s) hidden")
+        if warnings:
+            notices.append(f"{len(warnings)} shift summary warning(s)")
+        prefix = "Loaded" + (f"; {', '.join(notices)}" if notices else "") + "."
+        self.load_status_var.set(f"{prefix} Double-click a shift, sale, or cash movement for details.")
 
     def _insert_sale_row(self, parent, sale):
         created = str(row_get(sale, "created_at", "") or "")
@@ -11314,13 +12462,26 @@ class ShiftHistoryPage(tk.Frame):
             t_disp = created[11:16] if len(created) >= 16 else created
         receipt = str(row_get(sale, "receipt_code", "") or row_get(sale, "id", "") or "")
         pm = payment_method_label(row_get(sale, "payment_method", "") or "")
-        amount = sale_display_amount(sale)
-        self.tree.insert(
+        amount = self._sale_new_money_amount(sale)
+        iid = self.tree.insert(
             parent,
             tk.END,
             text=f"Sale {receipt}",
-            values=(t_disp, pm, "", "", drawer_money(amount), "", "")
+            values=(t_disp, pm, "", "", drawer_money(amount), "", ""),
+            tags=("sale",),
         )
+        self._loaded_rows[iid] = {
+            "title": f"Sale {receipt}",
+            "fields": [
+                ("Sale ID", row_get(sale, "id", "")),
+                ("Time", created),
+                ("Payment", pm),
+                ("New money", drawer_money(amount)),
+                ("Merchandise total", drawer_money(sale_display_amount(sale))),
+                ("Customer", row_get(sale, "customer_name", "") or ""),
+                ("Notes", row_get(sale, "notes", "") or ""),
+            ],
+        }
 
     def _insert_cash_movement_row(self, parent, movement):
         created = str(row_get(movement, "created_at", "") or "")
@@ -11336,12 +12497,24 @@ class ShiftHistoryPage(tk.Frame):
         label = f"Cash {'In' if mtype == 'IN' else 'Out'} #{movement_id}"
         if reason:
             label = f"{label}: {reason[:42]}"
-        self.tree.insert(
+        iid = self.tree.insert(
             parent,
             tk.END,
             text=label,
-            values=(t_disp, who, "", "", (drawer_money(amount) if mtype == "IN" else f"-{drawer_money(amount)}"), "", mtype)
+            values=(t_disp, who, "", "", (drawer_money(amount) if mtype == "IN" else f"-{drawer_money(amount)}"), "", mtype),
+            tags=("movement",),
         )
+        self._loaded_rows[iid] = {
+            "title": label,
+            "fields": [
+                ("Time", created),
+                ("Type", "Cash added" if mtype == "IN" else "Cash removed"),
+                ("Amount", drawer_money(amount)),
+                ("Employee", who or "Unassigned"),
+                ("Reason", reason),
+                ("Notes", row_get(movement, "notes", "") or ""),
+            ],
+        }
 
 
 class ReturnsPage(tk.Frame):

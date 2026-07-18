@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
+import calendar
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
@@ -65,6 +66,27 @@ MANAGER_ACTIONS = {
 
 def action_requires_manager(action: dict) -> bool:
     return str((action or {}).get("name") or "") in MANAGER_ACTIONS
+
+
+def capture_action_state(action: dict) -> dict:
+    """Capture the small reversible state associated with one approved AI action."""
+    from backend import find_product_by_barcode, get_bundle_offers_map, get_seasonal_sales_map
+    name = str((action or {}).get("name") or "")
+    args = dict((action or {}).get("args") or {})
+    barcode = str(args.get("barcode") or "").strip()
+    product = find_product_by_barcode(barcode) if barcode else None
+    if name == "adjust_stock":
+        return {"stock_qty": int(_value(product, "stock_qty", 0) or 0)}
+    if name in {"set_sale_price", "set_sale_percent", "remove_sale"}:
+        return {"offer": (get_seasonal_sales_map() or {}).get(barcode)}
+    if name in {"set_bundle", "remove_bundle"}:
+        return {"offer": (get_bundle_offers_map() or {}).get(barcode)}
+    if name == "update_product" and product:
+        return {key: _value(product, key) for key in (
+            "name", "sell_price", "stock_qty", "low_stock_level", "location",
+            "category", "brand", "cost_price", "supplier",
+        )}
+    return {}
 
 
 def audit_assistant_event(audit_path: str | Path, *, question: str, action: dict | None,
@@ -131,6 +153,22 @@ def _question_date_range(question: str, today: date | None = None) -> tuple[date
     if "yesterday" in text:
         day = today - timedelta(days=1)
         return day, day, "yesterday"
+    if "this week" in text or "week so far" in text or "week to date" in text:
+        return today - timedelta(days=today.weekday()), today, "this week so far"
+    if "this month" in text or "month so far" in text or "month to date" in text:
+        return today.replace(day=1), today, "this month so far"
+    if "this year" in text or "year so far" in text or "year to date" in text:
+        return today.replace(month=1, day=1), today, "this year so far"
+    for month_number, month_name in enumerate(calendar.month_name[1:], 1):
+        if re.search(rf"\b{month_name.lower()}\b", text):
+            year_match = re.search(r"\b(20\d{2})\b", text)
+            year = int(year_match.group(1)) if year_match else today.year
+            last_day = calendar.monthrange(year, month_number)[1]
+            start = date(year, month_number, 1)
+            full_end = date(year, month_number, last_day)
+            is_to_date = any(phrase in text for phrase in ("so far", "to date", "through today", "until today"))
+            end = min(full_end, today) if is_to_date and year == today.year and month_number == today.month else full_end
+            return start, end, f"{month_name} {year}"
     match = re.search(r"\b(?:last|past|for)\s+(\d{1,3})\s+days?\b", text)
     if match:
         days = max(1, min(366, int(match.group(1))))
@@ -167,6 +205,55 @@ def _append_cash_context(lines: list[str], conn, question: str, today: date) -> 
         lines.append(f"- {row['created_at']}: {direction}, {amount_text}, by {employee}, shift {row['shift_id'] or '-'}, reason: {reason}{suffix}")
 
 
+def _append_offer_context(lines: list[str], conn) -> None:
+    """Add trusted current offer data so Gemini never has to invent it."""
+    try:
+        from backend import get_bundle_offers_map, get_seasonal_sales_map
+        seasonal = get_seasonal_sales_map() or {}
+        bundles = get_bundle_offers_map() or {}
+    except Exception:
+        return
+    barcodes = sorted(set(seasonal) | set(bundles))
+    names = {}
+    if barcodes:
+        placeholders = ",".join("?" for _ in barcodes)
+        for row in _query(conn, f"SELECT barcode, name, sell_price FROM products WHERE barcode IN ({placeholders})", barcodes):
+            names[str(row["barcode"])] = (str(row["name"] or "Unknown product"), float(row["sell_price"] or 0))
+    lines.append(f"Active seasonal sale items: {len(seasonal)}.")
+    for barcode, offer in seasonal.items():
+        name, price = names.get(str(barcode), ("Unknown product", 0.0))
+        if str(offer.get("type") or "") == "price":
+            detail = f"fixed sale price {_money(offer.get('price'))} (regular {_money(price)})"
+        else:
+            detail = f"{float(offer.get('pct') or 0):g}% off (regular {_money(price)})"
+        lines.append(f"- {name} [{barcode}]: {detail}")
+    lines.append(f"Active bundle offer items: {len(bundles)}.")
+    for barcode, offer in bundles.items():
+        name, _price = names.get(str(barcode), ("Unknown product", 0.0))
+        lines.append(f"- {name} [{barcode}]: {int(offer.get('qty') or 0)} for {_money(offer.get('price'))}")
+
+
+def _append_inventory_intelligence_context(lines: list[str], db_path: Path, question: str) -> None:
+    words = ("low stock", "out of stock", "negative stock", "reorder", "overstock", "low performing", "performance")
+    if not any(word in str(question or "").lower() for word in words):
+        return
+    try:
+        from inventory_tools import inventory_metrics
+        metrics = inventory_metrics(db_path, 60, 14)
+    except Exception:
+        return
+    flagged = [row for row in metrics if row.get("flags")]
+    lines.append("Optional inventory recommendations (60-day demand, 14-day coverage; never automatic):")
+    for row in flagged[:80]:
+        flags = ", ".join(row.get("flags") or [])
+        lines.append(
+            f"- {row.get('name')} [{row.get('barcode')}]: stock {row.get('stock_qty')}, "
+            f"sold {row.get('units_sold')} in 60 days, floor {row.get('recommended_floor')}, "
+            f"suggested {row.get('suggested_qty')}, score {row.get('performance_score')}/100, {flags}; "
+            f"{row.get('explanation')}"
+        )
+
+
 def build_business_context(db_path: str | Path, question: str) -> str:
     """Build a compact, non-customer-identifying context for one question."""
     db_path = Path(db_path)
@@ -199,6 +286,8 @@ def build_business_context(db_path: str | Path, question: str) -> str:
             _append_cash_context(lines, conn, question, today)
         except sqlite3.Error:
             lines.append("Cash movement detail is unavailable in this database version.")
+        _append_offer_context(lines, conn)
+        _append_inventory_intelligence_context(lines, db_path, question)
 
         inventory = conn.execute(
             """
@@ -297,33 +386,37 @@ def ask_gemini(*, api_key: str, model: str, question: str, context: str,
         "for confirmation before execution, so never claim an action already happened. Never propose deleting products or "
         "sales, voiding financial records, replacing databases, changing credentials, or inventing missing values. Ask for "
         "missing required details instead. Resolve follow-ups from the recent conversation. When asked to create a sheet, "
-        "use create_business_report with xlsx. Use inclusive dates. Be concise, use product names before barcodes, and show "
+        "use create_business_report with xlsx. Treat seasonal discounts and bundle offers as different offer types and list "
+        "both when the manager asks what is on sale. Use inclusive dates. Be concise, use product names before barcodes, and show "
         "USD clearly.\n\n"
         f"RECENT CONVERSATION\n{history_text}\n\nLOCAL BUSINESS SUMMARY\n{context}\n\nMANAGER QUESTION\n{question}"
     )
-    response = requests.post(
-        GEMINI_ENDPOINT.format(model=model),
-        headers={"x-goog-api-key": api_key, "Content-Type": "application/json"},
-        json={
-            "contents": [{"role": "user", "parts": [{"text": prompt}]}],
-            "tools": [{"functionDeclarations": ACTION_DECLARATIONS}],
-            "generationConfig": {"temperature": 0.2, "maxOutputTokens": 900},
-        },
-        timeout=timeout,
-    )
-    if response.status_code == 429:
-        raise RuntimeError("Free Gemini quota reached. Try again after Google's quota resets. No charge was made.")
-    if response.status_code in (401, 403):
-        raise RuntimeError("Gemini rejected this API key. Check that it belongs to a free-tier project with billing disabled.")
-    if response.status_code >= 400:
-        try:
-            detail = str((response.json().get("error") or {}).get("message") or "").strip()
-        except Exception:
-            detail = ""
-        raise RuntimeError(detail or f"Gemini request failed (HTTP {response.status_code}).")
-    data = response.json() or {}
+    def request_once(contents, output_tokens=2400):
+        response = requests.post(
+            GEMINI_ENDPOINT.format(model=model),
+            headers={"x-goog-api-key": api_key, "Content-Type": "application/json"},
+            json={
+                "contents": contents,
+                "tools": [{"functionDeclarations": ACTION_DECLARATIONS}],
+                "generationConfig": {"temperature": 0.2, "maxOutputTokens": output_tokens},
+            }, timeout=timeout,
+        )
+        if response.status_code == 429:
+            raise RuntimeError("Free Gemini quota reached. Try again after Google's quota resets. No charge was made.")
+        if response.status_code in (401, 403):
+            raise RuntimeError("Gemini rejected this API key. Check that it belongs to a free-tier project with billing disabled.")
+        if response.status_code >= 400:
+            try:
+                detail = str((response.json().get("error") or {}).get("message") or "").strip()
+            except Exception:
+                detail = ""
+            raise RuntimeError(detail or f"Gemini request failed (HTTP {response.status_code}).")
+        return response.json() or {}
+
+    data = request_once([{"role": "user", "parts": [{"text": prompt}]}])
     try:
-        parts = data["candidates"][0]["content"]["parts"]
+        candidate = data["candidates"][0]
+        parts = candidate["content"]["parts"]
         text = "\n".join(str(part.get("text") or "") for part in parts if part.get("text"))
     except Exception as exc:
         raise RuntimeError("Gemini returned no readable answer.") from exc
@@ -335,6 +428,20 @@ def ask_gemini(*, api_key: str, model: str, question: str, context: str,
                 raise RuntimeError("Gemini requested an action that Mask POS does not allow.")
             return {"answer": text.strip() or "I prepared this action for your confirmation.",
                     "action": {"name": name, "args": dict(call.get("args") or {})}}
+    if str(candidate.get("finishReason") or "").upper() == "MAX_TOKENS":
+        continuation = (
+            "Finish the incomplete answer below. Return only the missing continuation, without restarting or repeating it. "
+            "Use only the supplied local summary.\n\n"
+            f"QUESTION\n{question}\n\nLOCAL SUMMARY\n{context}\n\nINCOMPLETE ANSWER\n{text}"
+        )
+        more_data = request_once([{"role": "user", "parts": [{"text": continuation}]}])
+        try:
+            more_parts = more_data["candidates"][0]["content"]["parts"]
+            more_text = "\n".join(str(part.get("text") or "") for part in more_parts if part.get("text")).strip()
+            if more_text:
+                text = (text.rstrip() + " " + more_text.lstrip()).strip()
+        except Exception:
+            pass
     if not text.strip() or text.strip().lower() in {"none", "null"}:
         raise RuntimeError("Gemini returned an empty answer.")
     return {"answer": text.strip(), "action": None}

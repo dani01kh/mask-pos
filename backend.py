@@ -2777,6 +2777,83 @@ def void_sale(sale_id, reason="", voided_by="", restore_stock=True):
     return bool(j.get("ok", True))
 
 
+def update_sale_payment_method(sale_id, payment_method, reason="", changed_by=""):
+    payload = {
+        "sale_id": int(sale_id),
+        "payment_method": str(payment_method or "").strip().upper(),
+        "reason": str(reason or ""),
+        "changed_by": str(changed_by or ""),
+    }
+    if _use_local_db():
+        result = _local().update_sale_payment_method(
+            sale_id,
+            payment_method,
+            reason,
+            changed_by,
+        )
+        sale, _items = _local().get_sale_detail(sale_id)
+        payload["sale"] = dict(sale) if sale else None
+        payload["result"] = dict(result or {})
+        _cloud_enqueue("update_payment", "sale", sale_id, payload)
+        return result
+    response = _remote_post("/sales/update_payment", payload)
+    if response.get("ok") is False:
+        raise RuntimeError(str(response.get("error") or "Payment correction failed."))
+    return response.get("result") or {}
+
+
+def update_sale_payment_split(sale_id, cash_amount=0.0, whish_amount=0.0, card_amount=0.0, reason="", changed_by=""):
+    payload = {
+        "sale_id": int(sale_id),
+        "payment_method": "",
+        "cash_amount": float(cash_amount or 0.0),
+        "whish_amount": float(whish_amount or 0.0),
+        "card_amount": float(card_amount or 0.0),
+        "reason": str(reason or ""),
+        "changed_by": str(changed_by or ""),
+    }
+    if _use_local_db():
+        result = _local().update_sale_payment_split(
+            sale_id,
+            cash_amount,
+            whish_amount,
+            card_amount,
+            reason,
+            changed_by,
+        )
+        sale, _items = _local().get_sale_detail(sale_id)
+        payload["payment_method"] = str((result or {}).get("new_payment_method") or "")
+        payload["sale"] = dict(sale) if sale else None
+        payload["result"] = dict(result or {})
+        _cloud_enqueue("update_payment", "sale", sale_id, payload)
+        return result
+    response = _remote_post("/sales/update_payment", payload)
+    if response.get("ok") is False:
+        raise RuntimeError(str(response.get("error") or "Payment correction failed."))
+    return response.get("result") or {}
+
+
+def reverse_cash_movement(movement_id, reason="", changed_by=""):
+    payload = {
+        "movement_id": int(movement_id),
+        "reason": str(reason or ""),
+        "changed_by": str(changed_by or ""),
+    }
+    if _use_local_db():
+        result = _local().reverse_cash_movement(movement_id, reason, changed_by)
+        reversal_id = int((result or {}).get("reversal_movement_id") or 0)
+        snapshot = _cash_movement_snapshot_local(reversal_id)
+        if snapshot:
+            snapshot["movement_id"] = reversal_id
+            snapshot["reversal_result"] = dict(result or {})
+            _cloud_enqueue("create", "cash_movement", reversal_id, snapshot)
+        return result
+    response = _remote_post("/cash_movements/reverse", payload)
+    if response.get("ok") is False:
+        raise RuntimeError(str(response.get("error") or "Cash movement reversal failed."))
+    return response.get("result") or {}
+
+
 # Employees / shifts
 
 def list_employees(active_only=True):
