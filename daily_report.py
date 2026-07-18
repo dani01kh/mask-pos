@@ -1163,14 +1163,29 @@ def build_cash_drawer_pdf(db_path: str, reports_folder: str, year: int = None, m
     }
 
 
-def _build_sales_report_excel_v2(db_path: str, reports_folder: str, year: int, month: int, day_str: str) -> dict:
+def _build_sales_report_excel_v2(
+    db_path: str,
+    reports_folder: str,
+    year: int = None,
+    month: int = None,
+    day_str: str = "All",
+    start_date=None,
+    end_date=None,
+    custom_stamp: str = "",
+) -> dict:
     from openpyxl import Workbook
     from openpyxl.chart import BarChart, Reference
     from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
     from openpyxl.worksheet.table import Table, TableStyleInfo
     from openpyxl.utils import get_column_letter
 
-    start, end, stamp = report_date_bounds(year, month, day_str)
+    if start_date is not None and end_date is not None:
+        start = start_date
+        end = end_date
+        stamp = custom_stamp or f"range_{start.strftime('%Y%m%d')}_to_{(end - timedelta(days=1)).strftime('%Y%m%d')}"
+    else:
+        now = datetime.now()
+        start, end, stamp = report_date_bounds(year or now.year, month or now.month, day_str or "All")
     if not os.path.exists(db_path):
         raise FileNotFoundError(f"Could not find database: {db_path}")
 
@@ -1863,6 +1878,20 @@ def _build_sales_report_excel_v2(db_path: str, reports_folder: str, year: int, m
 
 def build_sales_report_excel(db_path: str, reports_folder: str, year: int, month: int, day_str: str) -> dict:
     return _build_sales_report_excel_v2(db_path, reports_folder, year, month, day_str)
+
+
+def build_sales_report_excel_range(db_path: str, reports_folder: str, start_date, end_date, custom_stamp: str = "") -> dict:
+    """Build the detailed workbook for an inclusive custom date range.
+
+    ``end_date`` is exclusive, matching the existing report query helpers.
+    """
+    return _build_sales_report_excel_v2(
+        db_path,
+        reports_folder,
+        start_date=start_date,
+        end_date=end_date,
+        custom_stamp=custom_stamp,
+    )
 
     from openpyxl import Workbook
     from openpyxl.chart import BarChart, Reference

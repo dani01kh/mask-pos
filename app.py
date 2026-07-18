@@ -370,7 +370,14 @@ from backend import (
     set_ai_assistant_config,
 )
 
-from ai_assistant import ask_gemini, build_business_context, execute_approved_action, describe_action
+from ai_assistant import (
+    action_requires_manager,
+    ask_gemini,
+    audit_assistant_event,
+    build_business_context,
+    describe_action,
+    execute_approved_action,
+)
 
 try:
     from receipt_pdf import create_temp_receipt_pdf, create_gift_receipt_pdf, create_weekly_selection_receipt_pdf
@@ -7042,6 +7049,8 @@ class AIAssistantPage(tk.Frame):
     def __init__(self, parent):
         super().__init__(parent, bg=UI.CONTENT_BG)
         self._busy = False
+        self._history = []
+        self._pending_question = ""
         self._build()
 
     def _build(self):
@@ -7049,7 +7058,7 @@ class AIAssistantPage(tk.Frame):
         outer.pack(fill="both", expand=True, padx=18, pady=18)
         header = Card(outer, padx=18, pady=18)
         header.pack(fill="x")
-        HeaderBar(header.inner, "AI Assistant", "Free-tier Gemini with confirmation before every action.").pack(fill="x")
+        HeaderBar(header.inner, "AI Assistant", "Gemini-powered POS helper with manager controls and an action audit trail.").pack(fill="x")
 
         setup = Card(outer, padx=18, pady=14)
         setup.pack(fill="x", pady=(12, 0))
@@ -7067,7 +7076,7 @@ class AIAssistantPage(tk.Frame):
         ttk.Button(setup.inner, text="Save Free Key", command=self._save_settings).grid(row=1, column=2, padx=(10, 0), pady=(5, 0))
         setup.inner.grid_columnconfigure(0, weight=1)
         tk.Label(setup.inner,
-                 text="Use a Google AI Studio project with billing disabled. No paid fallback is configured. When free quota ends, AI stops. Every write and print requires confirmation.",
+                 text="Use a Google AI Studio project with billing disabled. No paid fallback is configured. When free quota ends, AI stops. Every write, offer, stock change, print, and report requires confirmation; business changes also require the manager password.",
                  font=UI.FONT_SM, bg=UI.CARD, fg=UI.MUTED, wraplength=900, justify="left").grid(row=2, column=0, columnspan=3, sticky="w", pady=(8, 0))
 
         chat_card = Card(outer, padx=14, pady=14)
@@ -7077,7 +7086,7 @@ class AIAssistantPage(tk.Frame):
         scroll = ttk.Scrollbar(chat_card.inner, orient="vertical", command=self.chat.yview)
         self.chat.configure(yscrollcommand=scroll.set)
         self.chat.pack(side="left", fill="both", expand=True); scroll.pack(side="right", fill="y")
-        self._append("Mask POS AI", "Ask about the business or request product, stock, offer, label, and warehouse actions. Nothing changes until you confirm.")
+        self._append("Mask POS AI", "Ask about sales, products, cash taken from the register, or request a date-range Excel/PDF report. You can also request product, stock, offer, label, and warehouse actions. Nothing changes until you confirm.")
 
         ask_card = Card(outer, padx=14, pady=12)
         ask_card.pack(fill="x", pady=(12, 0))
@@ -7087,6 +7096,7 @@ class AIAssistantPage(tk.Frame):
         buttons = tk.Frame(ask_card.inner, bg=UI.CARD); buttons.pack(side="left", padx=(10, 0))
         self.ask_button = PrimaryButton(buttons, "Ask Gemini", self._ask); self.ask_button.pack(fill="x")
         GhostButton(buttons, "Clear Chat", self._clear_chat).pack(fill="x", pady=(7, 0))
+        GhostButton(buttons, "Audit History", self._open_audit_history).pack(fill="x", pady=(7, 0))
         tk.Label(outer, textvariable=self.status_var, font=UI.FONT_SM, bg=UI.CONTENT_BG, fg=UI.MUTED).pack(anchor="w", pady=(6, 0))
 
     def _save_settings(self, show_message=True):
@@ -7105,7 +7115,42 @@ class AIAssistantPage(tk.Frame):
 
     def _clear_chat(self):
         self.chat.configure(state="normal"); self.chat.delete("1.0", "end"); self.chat.configure(state="disabled")
+        self._history.clear()
+        self._pending_question = ""
         self._append("Mask POS AI", "Chat cleared. POS data was not changed.")
+
+    def _open_audit_history(self):
+        path = Path(data_path("ai_assistant_audit.jsonl"))
+        records = []
+        if path.exists():
+            try:
+                for line in path.read_text(encoding="utf-8").splitlines()[-200:]:
+                    try:
+                        records.append(json.loads(line))
+                    except Exception:
+                        continue
+            except Exception as exc:
+                messagebox.showerror("AI Audit History", f"Could not read the audit history.\n\n{exc}")
+                return
+        win = tk.Toplevel(self)
+        win.title("AI Assistant Audit History")
+        win.geometry("980x560")
+        win.configure(bg=UI.CONTENT_BG)
+        text_box = tk.Text(win, wrap="word", bg=UI.SURFACE, fg=UI.TEXT, font=UI.FONT, padx=14, pady=14)
+        scroll = ttk.Scrollbar(win, orient="vertical", command=text_box.yview)
+        text_box.configure(yscrollcommand=scroll.set)
+        text_box.pack(side="left", fill="both", expand=True, padx=(12, 0), pady=12)
+        scroll.pack(side="right", fill="y", padx=(0, 12), pady=12)
+        if not records:
+            text_box.insert("end", "No AI actions have been proposed yet.")
+        else:
+            for record in reversed(records):
+                action = record.get("action") or {}
+                text_box.insert("end", f"{record.get('created_at', '')}  |  {record.get('status', '')}  |  {record.get('actor', '')}\n")
+                text_box.insert("end", f"Request: {record.get('question', '')}\n")
+                text_box.insert("end", f"Action: {action.get('name', '')} {action.get('args', {})}\n")
+                text_box.insert("end", f"Result: {record.get('details', '')}\n\n")
+        text_box.configure(state="disabled")
 
     def _ask(self):
         if self._busy: return
@@ -7114,12 +7159,16 @@ class AIAssistantPage(tk.Frame):
         if not self.key_var.get().strip():
             messagebox.showwarning("AI Assistant", "Paste a free-tier Gemini API key and save it first."); return
         self._save_settings(show_message=False); self.question.delete("1.0", "end"); self._append("You", question)
+        prior_history = list(self._history[-12:])
+        self._history.append({"role": "user", "content": question})
+        self._pending_question = question
         self._busy = True; self.ask_button.configure(state="disabled")
         self.status_var.set("Preparing a local summary and asking Gemini...")
         def worker():
             try:
                 result = ask_gemini(api_key=self.key_var.get().strip(), model=self.model_var.get().strip(),
-                                    question=question, context=build_business_context(data_path("pos.db"), question))
+                                    question=question, context=build_business_context(data_path("pos.db"), question),
+                                    history=prior_history)
                 self.after(0, lambda: self._finish(result, None))
             except Exception as exc:
                 self.after(0, lambda: self._finish(None, str(exc)))
@@ -7128,19 +7177,64 @@ class AIAssistantPage(tk.Frame):
     def _finish(self, result, error):
         self._busy = False; self.ask_button.configure(state="normal")
         if error:
-            self.status_var.set(error); self._append("Mask POS AI", error); return
-        self._append("Mask POS AI", result.get("answer") or "")
+            self.status_var.set(error); self._append("Mask POS AI", error)
+            self._history.append({"role": "assistant", "content": error})
+            return
+        answer = result.get("answer") or ""
+        self._append("Mask POS AI", answer)
+        self._history.append({"role": "assistant", "content": answer})
         action = result.get("action")
         if not action:
             self.status_var.set("Answer received. No POS data was changed."); return
-        details = describe_action(action)
-        if not messagebox.askyesno("Confirm AI action", f"Gemini proposes this action:\n\n{details}\n\nExecute it now?", parent=self.winfo_toplevel()):
-            self.status_var.set("Action cancelled. Nothing was changed."); self._append("Mask POS", "Action cancelled."); return
+        question = self._pending_question
+        actor = "Manager"
         try:
-            message = execute_approved_action(action)
+            shift = get_open_shift()
+            actor = str(row_get(shift, "employee_name", "") or "Manager").strip() or "Manager"
+        except Exception:
+            pass
+        details = describe_action(action)
+        audit_path = data_path("ai_assistant_audit.jsonl")
+        try:
+            audit_assistant_event(audit_path, question=question, action=action, status="PROPOSED", details=details, actor=actor)
+        except Exception:
+            pass
+        if not messagebox.askyesno("Confirm AI action", f"Gemini proposes this action:\n\n{details}\n\nExecute it now?", parent=self.winfo_toplevel()):
+            self.status_var.set("Action cancelled. Nothing was changed."); self._append("Mask POS", "Action cancelled.")
+            try:
+                audit_assistant_event(audit_path, question=question, action=action, status="CANCELLED", details="User declined confirmation.", actor=actor)
+            except Exception:
+                pass
+            return
+        if action_requires_manager(action):
+            password = simpledialog.askstring(
+                "Manager authorization", "Enter the manager password to approve this business change:",
+                show="*", parent=self.winfo_toplevel(),
+            )
+            if password is None or not verify_mode_admin_password(password):
+                message = "Manager authorization failed. Nothing was changed."
+                self.status_var.set(message); self._append("Mask POS", message)
+                try:
+                    audit_assistant_event(audit_path, question=question, action=action, status="DENIED", details=message, actor=actor)
+                except Exception:
+                    pass
+                return
+        try:
+            message = execute_approved_action(
+                action, db_path=data_path("pos.db"), reports_folder=data_path("reports"),
+            )
             self.status_var.set(message); self._append("Mask POS", message)
+            self._history.append({"role": "assistant", "content": f"Action result: {message}"})
+            try:
+                audit_assistant_event(audit_path, question=question, action=action, status="SUCCESS", details=message, actor=actor)
+            except Exception:
+                pass
         except Exception as exc:
             self.status_var.set(str(exc)); self._append("Mask POS", f"Action failed: {exc}")
+            try:
+                audit_assistant_event(audit_path, question=question, action=action, status="FAILED", details=str(exc), actor=actor)
+            except Exception:
+                pass
 
 
 # ---------------- ANALYTICS PAGE ----------------

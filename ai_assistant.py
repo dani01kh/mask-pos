@@ -1,14 +1,16 @@
-"""Read-only Gemini assistant for Mask POS.
+"""Controlled Gemini assistant for Mask POS.
 
-The assistant receives compact business summaries, never the database file. It has
-no mutation tools and cannot change products, stock, offers, sales, or settings.
+Gemini receives a compact, question-specific business summary rather than the
+database.  It may propose only the functions declared below; Mask POS validates,
+authorizes, confirms, executes, and audits every operational action.
 """
 
 from __future__ import annotations
 
+import json
 import re
 import sqlite3
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import requests
@@ -46,7 +48,40 @@ ACTION_DECLARATIONS = [
         "barcode": {"type": "STRING"}, "qty": {"type": "INTEGER"}}, "required": ["barcode", "qty"]}},
     {"name": "print_warehouse_sheet", "description": "Print a warehouse location sheet for products matching a search term; blank means all located products.", "parameters": {"type": "OBJECT", "properties": {
         "search": {"type": "STRING"}}}},
+    {"name": "create_business_report", "description": "Create a Mask POS report for an inclusive date range. Use xlsx when the manager says sheet, spreadsheet, or Excel; use pdf when requested.", "parameters": {"type": "OBJECT", "properties": {
+        "start_date": {"type": "STRING", "description": "Inclusive date in YYYY-MM-DD format."},
+        "end_date": {"type": "STRING", "description": "Inclusive date in YYYY-MM-DD format."},
+        "format": {"type": "STRING", "enum": ["xlsx", "pdf"]},
+        "report_type": {"type": "STRING", "enum": ["business", "sales", "cash_drawer"]}},
+        "required": ["start_date", "end_date", "format"]}},
 ]
+
+
+MANAGER_ACTIONS = {
+    "create_product", "update_product", "adjust_stock", "set_sale_price", "set_sale_percent",
+    "remove_sale", "set_bundle", "remove_bundle",
+}
+
+
+def action_requires_manager(action: dict) -> bool:
+    return str((action or {}).get("name") or "") in MANAGER_ACTIONS
+
+
+def audit_assistant_event(audit_path: str | Path, *, question: str, action: dict | None,
+                          status: str, details: str = "", actor: str = "") -> None:
+    """Append one local audit event without ever storing the Gemini API key."""
+    path = Path(audit_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    record = {
+        "created_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "actor": str(actor or "Manager").strip(),
+        "question": str(question or "").strip(),
+        "action": dict(action or {}),
+        "status": str(status or "").strip(),
+        "details": str(details or "").strip(),
+    }
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
 
 
 def _money(value) -> str:
@@ -75,6 +110,63 @@ def _period_summary(conn, start_day: str, end_day: str) -> dict:
             "discounts": float(row[2] or 0), "average": float(row[3] or 0)}
 
 
+def _question_date_range(question: str, today: date | None = None) -> tuple[date, date, str]:
+    """Infer the most useful inclusive range for local context, never for writes."""
+    today = today or date.today()
+    text = str(question or "").lower()
+    iso_dates = []
+    for raw in re.findall(r"\b\d{4}-\d{2}-\d{2}\b", text):
+        try:
+            iso_dates.append(datetime.strptime(raw, "%Y-%m-%d").date())
+        except ValueError:
+            pass
+    if len(iso_dates) >= 2:
+        start, end = sorted(iso_dates[:2])
+        return start, end, "dates stated in the request"
+    if len(iso_dates) == 1:
+        return iso_dates[0], iso_dates[0], "date stated in the request"
+    if "day before yesterday" in text:
+        day = today - timedelta(days=2)
+        return day, day, "day before yesterday"
+    if "yesterday" in text:
+        day = today - timedelta(days=1)
+        return day, day, "yesterday"
+    match = re.search(r"\b(?:last|past|for)\s+(\d{1,3})\s+days?\b", text)
+    if match:
+        days = max(1, min(366, int(match.group(1))))
+        return today - timedelta(days=days - 1), today, f"last {days} days including today"
+    if "today" in text:
+        return today, today, "today"
+    return today - timedelta(days=29), today, "last 30 days"
+
+
+def _append_cash_context(lines: list[str], conn, question: str, today: date) -> None:
+    cash_words = ("cash", "drawer", "register", "money", "taken out", "removed", "paid out", "payout")
+    if not any(word in str(question or "").lower() for word in cash_words):
+        return
+    start, end, label = _question_date_range(question, today)
+    end_exclusive = end + timedelta(days=1)
+    rows = _query(conn, """
+        SELECT created_at, shift_id, UPPER(COALESCE(movement_type, 'OUT')) AS movement_type,
+               amount_usd, amount_lbp, amount_value, reason, employee_name, notes
+        FROM cash_movements
+        WHERE datetime(created_at) >= datetime(?) AND datetime(created_at) < datetime(?)
+        ORDER BY datetime(created_at) DESC, id DESC LIMIT 100
+    """, (start.isoformat(), end_exclusive.isoformat()))
+    lines.append(f"Cash movements for {label} ({start.isoformat()} through {end.isoformat()}): {len(rows)} record(s).")
+    if not rows:
+        lines.append("- No recorded cash-in or cash-out movements in this period.")
+        return
+    for row in rows:
+        direction = "cash added" if str(row["movement_type"] or "").upper() == "IN" else "cash removed"
+        employee = str(row["employee_name"] or "Unassigned").strip()
+        reason = str(row["reason"] or "No reason recorded").strip()
+        notes = str(row["notes"] or "").strip()
+        amount_text = f"{_money(row['amount_value'])} value (USD {_money(row['amount_usd'])}, LBP {float(row['amount_lbp'] or 0):,.0f})"
+        suffix = f"; notes: {notes}" if notes else ""
+        lines.append(f"- {row['created_at']}: {direction}, {amount_text}, by {employee}, shift {row['shift_id'] or '-'}, reason: {reason}{suffix}")
+
+
 def build_business_context(db_path: str | Path, question: str) -> str:
     """Build a compact, non-customer-identifying context for one question."""
     db_path = Path(db_path)
@@ -94,6 +186,19 @@ def build_business_context(db_path: str | Path, question: str) -> str:
                 f"- {label}: {p['transactions']} transactions, {_money(p['sales'])} sales, "
                 f"{_money(p['discounts'])} discounts, {_money(p['average'])} average ticket"
             )
+
+        requested_start, requested_end, requested_label = _question_date_range(question, today)
+        requested = _period_summary(conn, requested_start.isoformat(), requested_end.isoformat())
+        lines.append(
+            f"Requested period ({requested_label}, {requested_start.isoformat()} through {requested_end.isoformat()}): "
+            f"{requested['transactions']} transactions, {_money(requested['sales'])} sales, "
+            f"{_money(requested['discounts'])} discounts, {_money(requested['average'])} average ticket."
+        )
+
+        try:
+            _append_cash_context(lines, conn, question, today)
+        except sqlite3.Error:
+            lines.append("Cash movement detail is unavailable in this database version.")
 
         inventory = conn.execute(
             """
@@ -171,20 +276,30 @@ def build_business_context(db_path: str | Path, question: str) -> str:
         conn.close()
 
 
-def ask_gemini(*, api_key: str, model: str, question: str, context: str, timeout: int = 45) -> dict:
+def ask_gemini(*, api_key: str, model: str, question: str, context: str,
+               history: list[dict] | None = None, timeout: int = 45) -> dict:
     api_key = str(api_key or "").strip()
     if not api_key:
         raise ValueError("Add your free Gemini API key first.")
     model = str(model or "gemini-3.1-flash-lite").strip()
     if model not in ALLOWED_MODELS:
         raise ValueError("Only approved Gemini free-tier models are allowed.")
+    history_lines = []
+    for turn in (history or [])[-12:]:
+        role = "Manager" if str(turn.get("role") or "").lower() == "user" else "Assistant"
+        content = str(turn.get("content") or "").strip()
+        if content:
+            history_lines.append(f"{role}: {content[:1200]}")
+    history_text = "\n".join(history_lines) or "(no earlier conversation)"
     prompt = (
         "You are the Mask POS manager assistant. Answer questions using only the local summary. You may propose exactly "
         "one provided function when the manager explicitly asks for an operational action. The application always asks "
         "for confirmation before execution, so never claim an action already happened. Never propose deleting products or "
         "sales, voiding financial records, replacing databases, changing credentials, or inventing missing values. Ask for "
-        "missing required details instead. Be concise, use product names before barcodes, and show USD clearly.\n\n"
-        f"LOCAL BUSINESS SUMMARY\n{context}\n\nMANAGER QUESTION\n{question}"
+        "missing required details instead. Resolve follow-ups from the recent conversation. When asked to create a sheet, "
+        "use create_business_report with xlsx. Use inclusive dates. Be concise, use product names before barcodes, and show "
+        "USD clearly.\n\n"
+        f"RECENT CONVERSATION\n{history_text}\n\nLOCAL BUSINESS SUMMARY\n{context}\n\nMANAGER QUESTION\n{question}"
     )
     response = requests.post(
         GEMINI_ENDPOINT.format(model=model),
@@ -243,12 +358,14 @@ def describe_action(action: dict) -> str:
         "set_sale_price": "Set fixed sale price", "set_sale_percent": "Set sale percentage",
         "remove_sale": "Remove seasonal sale", "set_bundle": "Set bundle offer", "remove_bundle": "Remove bundle offer",
         "print_barcode_labels": "Print barcode labels", "print_warehouse_sheet": "Print warehouse sheet",
+        "create_business_report": "Create business report",
     }
     details = "\n".join(f"{key}: {value}" for key, value in args.items())
     return f"{labels.get(name, name)}\n\n{details}".strip()
 
 
-def execute_approved_action(action: dict) -> str:
+def execute_approved_action(action: dict, *, db_path: str | Path | None = None,
+                            reports_folder: str | Path | None = None) -> str:
     """Execute one user-confirmed action through the existing backend rules."""
     from backend import (
         add_product, adjust_stock, find_product_by_barcode, get_store_name, list_products,
@@ -260,6 +377,37 @@ def execute_approved_action(action: dict) -> str:
     name = str((action or {}).get("name") or "")
     args = dict((action or {}).get("args") or {})
     barcode = str(args.get("barcode") or "").strip()
+
+    if name == "create_business_report":
+        if not db_path or not reports_folder:
+            raise ValueError("The local database and reports folder are required.")
+        try:
+            start = datetime.strptime(str(args.get("start_date") or ""), "%Y-%m-%d")
+            end_inclusive = datetime.strptime(str(args.get("end_date") or ""), "%Y-%m-%d")
+        except ValueError as exc:
+            raise ValueError("Report dates must use YYYY-MM-DD.") from exc
+        if end_inclusive < start:
+            raise ValueError("The report end date cannot be before the start date.")
+        if (end_inclusive.date() - start.date()).days > 366:
+            raise ValueError("Assistant reports are limited to 367 days at a time.")
+        end_exclusive = end_inclusive + timedelta(days=1)
+        stamp = f"range_{start.strftime('%Y%m%d')}_to_{end_inclusive.strftime('%Y%m%d')}"
+        output_format = str(args.get("format") or "xlsx").strip().lower()
+        import daily_report
+        if output_format == "xlsx":
+            result = daily_report.build_sales_report_excel_range(
+                str(db_path), str(reports_folder), start, end_exclusive, custom_stamp=stamp,
+            )
+        elif output_format == "pdf":
+            result = daily_report.build_cash_drawer_pdf(
+                str(db_path), str(reports_folder), start_date=start, end_date=end_exclusive, custom_stamp=stamp,
+            )
+        else:
+            raise ValueError("Report format must be xlsx or pdf.")
+        path = str((result or {}).get("path") or "").strip()
+        if not path:
+            raise RuntimeError("The report generator did not return a saved file.")
+        return f"Report created for {start.strftime('%Y-%m-%d')} through {end_inclusive.strftime('%Y-%m-%d')}:\n{path}"
 
     if name == "create_product":
         if not str(args.get("name") or "").strip() or float(args.get("sell_price") or 0) < 0:

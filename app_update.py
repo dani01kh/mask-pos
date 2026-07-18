@@ -14,7 +14,7 @@ from pathlib import Path
 import requests
 
 
-APP_VERSION = "3.15.7"
+APP_VERSION = "3.15.8"
 GITHUB_REPO = "dani01kh/mask-pos"
 LATEST_RELEASE_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 INSTALLER_SCRIPT_NAME = "install_maskpos_update.ps1"
