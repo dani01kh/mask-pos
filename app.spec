@@ -63,8 +63,9 @@ hiddenimports += [
 # -------------------------------------------------
 # Matplotlib
 # -------------------------------------------------
-add_pkg("matplotlib")
-
+# Let PyInstaller's standard matplotlib hook collect only the Tk/Agg runtime.
+# collect_all("matplotlib") pulled every GUI backend, including the unused
+# PySide6/Qt stack, adding tens of megabytes to every updater ZIP.
 hiddenimports += [
     "matplotlib.backends.backend_tkagg",
     "matplotlib.backends.backend_agg",
@@ -128,7 +129,7 @@ a = Analysis(
     hiddenimports=hiddenimports,
     hookspath=[],
     runtime_hooks=[],
-    excludes=["pandas"],  # keep pandas excluded
+    excludes=["pandas", "PySide6", "shiboken6", "matplotlib.tests"],
     noarchive=False,
 )
 
