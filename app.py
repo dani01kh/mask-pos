@@ -14444,7 +14444,10 @@ def _bundle_offer_manager_window(parent):
             return
         for iid in sels:
             vals = res_tree.item(iid, "values") or ()
-            bc = str(vals[2] if len(vals) > 2 else "").strip()
+            # Search results are (barcode, name, price). The old code used
+            # the price as the map key, causing same-priced products to
+            # overwrite each other and later display a price as the name.
+            bc = str(vals[0] if len(vals) > 0 else "").strip()
             if not bc:
                 continue
             try:
@@ -14459,7 +14462,8 @@ def _bundle_offer_manager_window(parent):
             return
         for iid in sels:
             vals = offer_tree.item(iid, "values") or ()
-            bc = str(vals[0] if len(vals) > 0 else "").strip()
+            # Current offers are (old price, new/unit, barcode, qty, bundle).
+            bc = str(vals[2] if len(vals) > 2 else "").strip()
             if not bc:
                 continue
             try:
