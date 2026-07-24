@@ -351,6 +351,7 @@ from backend import (
     get_seasonal_sales_map,
     set_seasonal_sale_item,
     set_seasonal_sale_price_item,
+    update_seasonal_sale_items,
     remove_seasonal_sale_item,
     clear_seasonal_sales,
     get_bundle_offers_enabled,
@@ -15229,7 +15230,7 @@ def _warehouse_paper_window(parent):
     refresh_paper()
 
 
-def _seasonal_sale_manager_window(parent):
+def _legacy_seasonal_sale_manager_window(parent):
     """Open the Seasonal Sale manager window (bulk add/remove sale items)."""
     win = tk.Toplevel(parent)
     win.title("Seasonal Sale")
@@ -15511,6 +15512,528 @@ def _seasonal_sale_manager_window(parent):
 
     refresh_current()
     refresh_results()
+
+
+def _seasonal_sale_manager_window(parent):
+    """Searchable, explicit, and verified seasonal-sale management."""
+    win = tk.Toplevel(parent)
+    win.title("Seasonal Sale")
+    win.geometry("1180x680")
+    win.minsize(1040, 600)
+    win.configure(bg=UI.CONTENT_BG)
+    win.grab_set()
+
+    outer = Card(win, padx=16, pady=16)
+    outer.pack(fill="both", expand=True, padx=14, pady=14)
+    HeaderBar(
+        outer.inner,
+        "Seasonal Sale",
+        "Search every product, see its current discount, then apply 20%, 30%, or a fixed price.",
+    ).pack(fill="x")
+
+    content = tk.Frame(outer.inner, bg=UI.CARD)
+    content.pack(fill="both", expand=True, pady=(14, 0))
+    content.grid_columnconfigure(0, weight=9)
+    content.grid_columnconfigure(1, weight=11)
+    content.grid_rowconfigure(1, weight=1)
+
+    top = tk.Frame(content, bg=UI.CARD)
+    top.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 10))
+    try:
+        enabled_var = tk.BooleanVar(value=bool(get_seasonal_sale_enabled()))
+    except Exception:
+        enabled_var = tk.BooleanVar(value=False)
+    enabled_status = tk.Label(top, bg=UI.CARD, font=UI.FONT_SM)
+
+    def refresh_enabled_status():
+        if enabled_var.get():
+            enabled_status.configure(text="ON — discounts apply in Cashier", fg="#15803d")
+        else:
+            enabled_status.configure(text="OFF — items stay saved, but discounts do not apply", fg="#b45309")
+
+    def toggle_enabled():
+        requested = bool(enabled_var.get())
+        try:
+            set_seasonal_sale_enabled(requested)
+            if bool(get_seasonal_sale_enabled()) != requested:
+                raise RuntimeError("The saved status could not be verified.")
+        except Exception as exc:
+            enabled_var.set(not requested)
+            messagebox.showerror("Seasonal Sale", f"Could not change the sale status:\n\n{exc}", parent=win)
+        refresh_enabled_status()
+
+    tk.Checkbutton(
+        top, text="Enable Seasonal Sale", variable=enabled_var, bg=UI.CARD,
+        command=toggle_enabled, font=UI.FONT_MD,
+    ).pack(side="left")
+    enabled_status.pack(side="left", padx=(12, 0))
+    refresh_enabled_status()
+
+    left = tk.Frame(content, bg=UI.CARD)
+    left.grid(row=1, column=0, sticky="nsew", padx=(0, 12))
+    current_title_var = tk.StringVar(value="Items Currently on Sale")
+    tk.Label(left, textvariable=current_title_var, font=UI.FONT_MD, bg=UI.CARD, fg=UI.TEXT).pack(anchor="w")
+    tk.Label(
+        left, text="Select an item below to remove only that item.",
+        font=UI.FONT_SM, bg=UI.CARD, fg=UI.MUTED,
+    ).pack(anchor="w", pady=(1, 6))
+
+    current_search_row = tk.Frame(left, bg=UI.CARD)
+    current_search_row.pack(fill="x", pady=(0, 8))
+    current_search_var = tk.StringVar()
+    current_search_entry = ttk.Entry(current_search_row, textvariable=current_search_var)
+    current_search_entry.pack(side="left", fill="x", expand=True)
+
+    sale_frame = tk.Frame(left, bg=UI.CARD)
+    sale_frame.pack(fill="both", expand=True)
+    sale_cols = ("name", "old", "new", "offer", "barcode")
+    sale_tree = ttk.Treeview(sale_frame, columns=sale_cols, show="headings", selectmode="browse", height=16)
+    for col, title, width, anchor in (
+        ("name", "Product", 205, "w"), ("old", "Regular", 70, "e"),
+        ("new", "Sale Price", 76, "e"), ("offer", "Discount", 82, "center"),
+        ("barcode", "Barcode", 118, "w"),
+    ):
+        sale_tree.heading(col, text=title)
+        sale_tree.column(col, width=width, anchor=anchor)
+    sale_scroll = ttk.Scrollbar(sale_frame, orient="vertical", command=sale_tree.yview)
+    sale_tree.configure(yscrollcommand=sale_scroll.set)
+    sale_tree.pack(side="left", fill="both", expand=True)
+    sale_scroll.pack(side="right", fill="y")
+
+    right = tk.Frame(content, bg=UI.CARD)
+    right.grid(row=1, column=1, sticky="nsew")
+    tk.Label(right, text="Find Products and Set Their Sale", font=UI.FONT_MD, bg=UI.CARD, fg=UI.TEXT).pack(anchor="w")
+    tk.Label(
+        right,
+        text="Green rows are already on sale. “New price” is a preview before you apply.",
+        font=UI.FONT_SM, bg=UI.CARD, fg=UI.MUTED,
+    ).pack(anchor="w", pady=(1, 6))
+
+    offer_row = tk.Frame(right, bg=UI.CARD)
+    offer_row.pack(fill="x", pady=(0, 8))
+    tk.Label(offer_row, text="Apply", bg=UI.CARD, fg=UI.TEXT).pack(side="left")
+    method_var = tk.StringVar(value="Discount %")
+    method_box = ttk.Combobox(
+        offer_row, textvariable=method_var, values=["Discount %", "Fixed price"],
+        width=12, state="readonly",
+    )
+    method_box.pack(side="left", padx=(7, 10))
+    tk.Label(offer_row, text="Value", bg=UI.CARD, fg=UI.TEXT).pack(side="left")
+    offer_value_var = tk.StringVar(value="20")
+    offer_value_entry = ttk.Entry(offer_row, textvariable=offer_value_var, width=8)
+    offer_value_entry.pack(side="left", padx=(7, 10))
+
+    search_row = tk.Frame(right, bg=UI.CARD)
+    search_row.pack(fill="x", pady=(0, 8))
+    search_var = tk.StringVar()
+    search_entry = ttk.Entry(search_row, textvariable=search_var)
+    search_entry.pack(side="left", fill="x", expand=True)
+
+    result_frame = tk.Frame(right, bg=UI.CARD)
+    result_frame.pack(fill="both", expand=True)
+    result_cols = ("name", "regular", "current", "preview", "barcode")
+    result_tree = ttk.Treeview(result_frame, columns=result_cols, show="headings", selectmode="extended", height=16)
+    for col, title, width, anchor in (
+        ("name", "Product", 220, "w"), ("regular", "Regular", 68, "e"),
+        ("current", "Current Sale", 105, "center"), ("preview", "New Price", 78, "e"),
+        ("barcode", "Barcode", 120, "w"),
+    ):
+        result_tree.heading(col, text=title)
+        result_tree.column(col, width=width, anchor=anchor)
+    result_scroll = ttk.Scrollbar(result_frame, orient="vertical", command=result_tree.yview)
+    result_tree.configure(yscrollcommand=result_scroll.set)
+    result_tree.pack(side="left", fill="both", expand=True)
+    result_scroll.pack(side="right", fill="y")
+    result_tree.tag_configure("on_sale", background="#dcfce7", foreground="#14532d")
+
+    def toggle_result_selection(event):
+        iid = result_tree.identify_row(event.y)
+        if not iid:
+            return None
+        if iid in result_tree.selection():
+            result_tree.selection_remove(iid)
+        else:
+            result_tree.selection_add(iid)
+        return "break"
+
+    result_tree.bind("<Button-1>", toggle_result_selection)
+
+    button_row = tk.Frame(content, bg=UI.CARD)
+    button_row.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+    button_row.grid_columnconfigure(0, weight=1)
+    button_row.grid_columnconfigure(1, weight=1)
+
+    catalog_rows = []
+    catalog_by_barcode = {}
+    sale_row_barcodes = {}
+    result_rows = {}
+
+    def load_catalog(force=False):
+        nonlocal catalog_rows, catalog_by_barcode
+        if catalog_rows and not force:
+            return
+        catalog_rows = list(list_products(""))
+        catalog_by_barcode = {
+            str(row_get(row, "barcode") or "").strip(): row
+            for row in catalog_rows if str(row_get(row, "barcode") or "").strip()
+        }
+
+    def parse_offer():
+        try:
+            raw = str(offer_value_var.get() or "").strip().replace("%", "").replace("$", "")
+            value = float(raw)
+        except Exception as exc:
+            raise ValueError("Enter a valid number for the discount.") from exc
+        kind = "percent" if method_var.get() == "Discount %" else "price"
+        if kind == "percent" and not (0 < value <= 100):
+            raise ValueError("Discount percentage must be between 0 and 100.")
+        if kind == "price" and value <= 0:
+            raise ValueError("Fixed sale price must be greater than zero.")
+        return kind, value
+
+    def offer_details(offer, regular_price):
+        kind = str((offer or {}).get("type") or "percent").lower() if isinstance(offer, dict) else "percent"
+        if kind == "price":
+            new_price = float((offer or {}).get("price") or 0.0)
+            return "Fixed price", new_price
+        pct = float((offer or {}).get("pct") or (offer if not isinstance(offer, dict) else 0.0) or 0.0)
+        return f"{pct:g}% OFF", regular_price * (1.0 - pct / 100.0)
+
+    def row_matches(row, query):
+        tokens = re.findall(r"[a-z0-9]+", str(query or "").lower())
+        if not tokens:
+            return True
+        haystack = " ".join(
+            str(row_get(row, key) or "").lower()
+            for key in ("name", "barcode", "category", "brand", "location")
+        )
+        return all(
+            token in haystack or (len(token) > 3 and token.endswith("s") and token[:-1] in haystack)
+            for token in tokens
+        )
+
+    def refresh_current():
+        sale_row_barcodes.clear()
+        current_children = sale_tree.get_children()
+        if current_children:
+            sale_tree.delete(*current_children)
+        try:
+            load_catalog()
+            sale_map = get_seasonal_sales_map()
+        except Exception as exc:
+            messagebox.showerror("Seasonal Sale", f"Could not load current sale items:\n\n{exc}", parent=win)
+            return
+        query = current_search_var.get().strip().lower()
+        shown = 0
+        for index, bc in enumerate(sorted(sale_map)):
+            offer = sale_map[bc]
+            row = catalog_by_barcode.get(str(bc))
+            name = str(row_get(row, "name") or bc)
+            regular = float(row_get(row, "sell_price") or 0.0)
+            offer_text, new_price = offer_details(offer, regular)
+            if query and not (
+                (row is not None and row_matches(row, query))
+                or query in f"{name} {bc} {offer_text}".lower()
+            ):
+                continue
+            iid = f"sale_{index}"
+            sale_tree.insert(
+                "", tk.END, iid=iid,
+                values=(name, money(regular), money(new_price), offer_text, bc),
+            )
+            sale_row_barcodes[iid] = str(bc)
+            shown += 1
+        title = f"Items Currently on Sale ({len(sale_map)})"
+        current_title_var.set(title + (f" — {shown} shown" if query else ""))
+
+    def refresh_results():
+        selected = {
+            str((result_rows.get(iid) or {}).get("barcode") or "")
+            for iid in result_tree.selection()
+        }
+        result_rows.clear()
+        result_children = result_tree.get_children()
+        if result_children:
+            result_tree.delete(*result_children)
+        try:
+            load_catalog()
+            sale_map = get_seasonal_sales_map()
+        except Exception as exc:
+            messagebox.showerror("Seasonal Sale", f"Could not load products:\n\n{exc}", parent=win)
+            return
+        try:
+            kind, value = parse_offer()
+        except ValueError:
+            kind, value = "percent", 0.0
+
+        matching = [row for row in catalog_rows if row_matches(row, search_var.get())]
+        for index, row in enumerate(matching):
+            bc = str(row_get(row, "barcode") or "").strip()
+            if not bc:
+                continue
+            name = str(row_get(row, "name") or bc)
+            regular = float(row_get(row, "sell_price") or 0.0)
+            existing = sale_map.get(bc)
+            current_text = offer_details(existing, regular)[0] if existing else "Not on sale"
+            if value <= 0:
+                preview = "—"
+            elif kind == "price":
+                preview = money(value) if value < regular else "Invalid"
+            else:
+                preview = money(regular * (1.0 - value / 100.0))
+            iid = f"result_{index}"
+            result_rows[iid] = {"barcode": bc, "name": name, "price": regular}
+            result_tree.insert(
+                "", tk.END, iid=iid,
+                values=(name, money(regular), current_text, preview, bc),
+                tags=("on_sale",) if existing else (),
+            )
+            if bc in selected:
+                result_tree.selection_add(iid)
+
+    def apply_selected():
+        try:
+            kind, value = parse_offer()
+        except ValueError as exc:
+            messagebox.showerror("Seasonal Sale", str(exc), parent=win)
+            return
+        selection = result_tree.selection()
+        if not selection:
+            messagebox.showinfo("Seasonal Sale", "Select one or more products first.", parent=win)
+            return
+        changes = {}
+        invalid = []
+        for iid in selection:
+            row = result_rows.get(iid) or {}
+            bc = str(row.get("barcode") or "").strip()
+            regular = float(row.get("price") or 0.0)
+            if kind == "price" and (regular <= 0 or value >= regular):
+                invalid.append(str(row.get("name") or bc))
+            elif bc:
+                value_key = "price" if kind == "price" else "pct"
+                changes[bc] = {"type": kind, value_key: value}
+        if invalid:
+            names = "\n".join(f"• {name}" for name in invalid[:8])
+            messagebox.showerror(
+                "Sale price is not lower",
+                f"The fixed sale price must be lower than the regular price:\n\n{names}",
+                parent=win,
+            )
+            return
+        if not changes:
+            return
+        if len(changes) > 1:
+            offer_text = f"{value:g}% OFF" if kind == "percent" else f"{money(value)} fixed price"
+            if not messagebox.askyesno(
+                "Confirm Bulk Sale Update",
+                f"Apply {offer_text} to {len(changes)} selected products?\n\n"
+                "Existing green items will be updated. Other selected items will be added to the sale.",
+                parent=win,
+            ):
+                return
+        try:
+            saved = update_seasonal_sale_items(changes)
+            for bc, expected in changes.items():
+                actual = saved.get(bc) or {}
+                value_key = "price" if expected["type"] == "price" else "pct"
+                if (
+                    str(actual.get("type") or "").lower() != expected["type"]
+                    or abs(float(actual.get(value_key) or 0.0) - float(expected[value_key])) > 0.001
+                ):
+                    raise RuntimeError("The saved sale could not be verified.")
+        except Exception as exc:
+            messagebox.showerror("Seasonal Sale", f"Nothing was changed:\n\n{exc}", parent=win)
+            return
+        refresh_current()
+        refresh_results()
+        suffix = "" if enabled_var.get() else "\n\nThe sale is currently OFF. Turn it on above when the store sale starts."
+        messagebox.showinfo(
+            "Seasonal Sale Saved",
+            f"Saved the sale for {len(changes)} product(s).{suffix}",
+            parent=win,
+        )
+
+    def remove_selected_results_from_sale():
+        selection = result_tree.selection()
+        if not selection:
+            messagebox.showinfo(
+                "Seasonal Sale",
+                "Select one or more green products to remove from the sale.",
+                parent=win,
+            )
+            return
+        try:
+            sale_map = get_seasonal_sales_map()
+        except Exception as exc:
+            messagebox.showerror("Seasonal Sale", f"Could not load the sale items:\n\n{exc}", parent=win)
+            return
+
+        selected_rows = [result_rows.get(iid) or {} for iid in selection]
+        sale_rows = [
+            row for row in selected_rows
+            if str(row.get("barcode") or "").strip() in sale_map
+        ]
+        not_on_sale_count = len(selected_rows) - len(sale_rows)
+        if not sale_rows:
+            messagebox.showinfo(
+                "Seasonal Sale",
+                "None of the selected products are currently on sale.\n\nGreen rows are the products that can be removed.",
+                parent=win,
+            )
+            return
+
+        barcodes = [str(row.get("barcode") or "").strip() for row in sale_rows]
+        if set(barcodes) == set(sale_map):
+            messagebox.showwarning(
+                "Password Required",
+                "This selection would remove every seasonal-sale item.\n\nUse “Remove All (Password)” and enter password 1234.",
+                parent=win,
+            )
+            return
+
+        names = [str(row.get("name") or row.get("barcode") or "") for row in sale_rows]
+        preview = "\n".join(f"• {name}" for name in names[:10])
+        if len(names) > 10:
+            preview += f"\n• …and {len(names) - 10} more"
+        unchanged_note = (
+            f"\n\n{not_on_sale_count} selected non-green item(s) are not on sale and will stay unchanged."
+            if not_on_sale_count else ""
+        )
+        if not messagebox.askyesno(
+            "Remove Selected From Sale",
+            f"Remove these {len(sale_rows)} selected product(s) from the seasonal sale?\n\n"
+            f"{preview}{unchanged_note}",
+            parent=win,
+        ):
+            return
+        try:
+            saved = update_seasonal_sale_items(remove_barcodes=barcodes)
+            still_present = [bc for bc in barcodes if bc in saved]
+            if still_present:
+                raise RuntimeError("The selected removal could not be verified.")
+        except Exception as exc:
+            messagebox.showerror("Seasonal Sale", f"No items were removed:\n\n{exc}", parent=win)
+            return
+        refresh_current()
+        refresh_results()
+        messagebox.showinfo(
+            "Seasonal Sale",
+            f"Removed {len(barcodes)} selected product(s) from the sale.",
+            parent=win,
+        )
+
+    def remove_selected():
+        selection = sale_tree.selection()
+        if not selection:
+            messagebox.showinfo("Seasonal Sale", "Select the item you want to remove.", parent=win)
+            return
+        iid = selection[0]
+        bc = sale_row_barcodes.get(iid, "")
+        values = sale_tree.item(iid, "values") or ()
+        name = str(values[0] if values else bc)
+        if not messagebox.askyesno(
+            "Remove One Sale Item",
+            f"Remove only this product from the seasonal sale?\n\n{name}\n{bc}",
+            parent=win,
+        ):
+            return
+        try:
+            saved = update_seasonal_sale_items(remove_barcodes=[bc])
+            if bc in saved:
+                raise RuntimeError("The removal could not be verified.")
+        except Exception as exc:
+            messagebox.showerror("Seasonal Sale", f"The item was not removed:\n\n{exc}", parent=win)
+            return
+        refresh_current()
+        refresh_results()
+
+    def remove_all_sale_items():
+        try:
+            sale_map = get_seasonal_sales_map()
+        except Exception as exc:
+            messagebox.showerror("Seasonal Sale", f"Could not load the sale items:\n\n{exc}", parent=win)
+            return
+        if not sale_map:
+            messagebox.showinfo("Seasonal Sale", "There are no sale items to remove.", parent=win)
+            return
+
+        password = simpledialog.askstring(
+            "Password Required",
+            "Enter the password to remove ALL seasonal sale items:",
+            show="*",
+            parent=win,
+        )
+        if password is None:
+            return
+        if password != "1234":
+            messagebox.showerror("Wrong Password", "The password is incorrect. Nothing was removed.", parent=win)
+            return
+        if not messagebox.askyesno(
+            "Final Confirmation",
+            f"Password accepted.\n\nRemove all {len(sale_map)} items from the seasonal sale?\n\nThis cannot be undone.",
+            parent=win,
+        ):
+            return
+        try:
+            saved = update_seasonal_sale_items(remove_barcodes=list(sale_map))
+            if saved:
+                raise RuntimeError("The remove-all operation could not be verified.")
+        except Exception as exc:
+            messagebox.showerror("Seasonal Sale", f"No items were removed:\n\n{exc}", parent=win)
+            return
+        refresh_current()
+        refresh_results()
+        messagebox.showinfo(
+            "Seasonal Sale",
+            f"Removed all {len(sale_map)} items from the seasonal sale.",
+            parent=win,
+        )
+
+    def select_all_results():
+        children = result_tree.get_children()
+        if children:
+            result_tree.selection_set(*children)
+
+    def clear_result_selection():
+        selection = result_tree.selection()
+        if selection:
+            result_tree.selection_remove(*selection)
+
+    GhostButton(current_search_row, "Search Sale", refresh_current).pack(side="left", padx=(8, 0))
+    current_search_entry.bind("<Return>", lambda _event: refresh_current())
+    GhostButton(search_row, "Search Products", refresh_results).pack(side="left", padx=(8, 0))
+    search_entry.bind("<Return>", lambda _event: refresh_results())
+
+    def use_discount(percent):
+        method_var.set("Discount %")
+        offer_value_var.set(str(percent))
+        refresh_results()
+
+    GhostButton(offer_row, "20% Off", lambda: use_discount(20)).pack(side="left", padx=(0, 6))
+    GhostButton(offer_row, "30% Off", lambda: use_discount(30)).pack(side="left")
+    method_box.bind("<<ComboboxSelected>>", lambda _event: refresh_results())
+    offer_value_entry.bind("<Return>", lambda _event: refresh_results())
+    offer_value_entry.bind("<FocusOut>", lambda _event: refresh_results())
+
+    left_buttons = tk.Frame(button_row, bg=UI.CARD)
+    left_buttons.grid(row=0, column=0, sticky="w")
+    DangerButton(left_buttons, "Remove This Item From Sale", remove_selected).pack(side="left", padx=(0, 8))
+    DangerButton(left_buttons, "Remove All (Password)", remove_all_sale_items).pack(side="left")
+    right_buttons = tk.Frame(button_row, bg=UI.CARD)
+    right_buttons.grid(row=0, column=1, sticky="e")
+    GhostButton(right_buttons, "Select Everything", select_all_results).pack(side="left", padx=(0, 8))
+    GhostButton(right_buttons, "Clear", clear_result_selection).pack(side="left", padx=(0, 8))
+    DangerButton(
+        right_buttons, "Remove Selected From Sale", remove_selected_results_from_sale
+    ).pack(side="left", padx=(0, 8))
+    PrimaryButton(right_buttons, "Apply / Update Selected Items", apply_selected).pack(side="left")
+
+    try:
+        load_catalog()
+        refresh_current()
+        refresh_results()
+    except Exception as exc:
+        messagebox.showerror("Seasonal Sale", f"Could not open the sale manager:\n\n{exc}", parent=win)
 
 
 def _bundle_offer_manager_window(parent):

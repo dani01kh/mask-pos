@@ -1125,6 +1125,69 @@ def set_seasonal_sale_price_item(barcode: str, sale_price: float) -> None:
     _cloud_enqueue_config(_offers_config_payload())
 
 
+def update_seasonal_sale_items(offers: dict | None = None, remove_barcodes=None) -> dict:
+    """Atomically add/update/remove several seasonal sale items.
+
+    ``offers`` is keyed by barcode and accepts normalized percentage or fixed
+    price dictionaries.  All changes are validated before the config is
+    written, preventing a partially-applied bulk operation.
+    """
+    normalized = {}
+    for barcode, offer in (offers or {}).items():
+        bc = str(barcode or "").strip()
+        if not bc:
+            raise ValueError("Every seasonal sale item must have a barcode.")
+        if not isinstance(offer, dict):
+            raise ValueError(f"Invalid seasonal sale offer for barcode {bc}.")
+        kind = str(offer.get("type") or "").strip().lower()
+        if kind == "price":
+            try:
+                value = round(float(offer.get("price") or 0.0), 2)
+            except Exception as exc:
+                raise ValueError(f"Invalid sale price for barcode {bc}.") from exc
+            if value <= 0.0:
+                raise ValueError(f"Sale price must be greater than zero for barcode {bc}.")
+            normalized[bc] = {"type": "price", "price": value}
+        elif kind in ("percent", "percentage"):
+            try:
+                value = round(float(offer.get("pct") or 0.0), 2)
+            except Exception as exc:
+                raise ValueError(f"Invalid discount percentage for barcode {bc}.") from exc
+            if value <= 0.0 or value > 100.0:
+                raise ValueError(f"Discount must be between 0 and 100% for barcode {bc}.")
+            normalized[bc] = {"type": "percent", "pct": value}
+        else:
+            raise ValueError(f"Choose a valid sale method for barcode {bc}.")
+
+    removals = set()
+    for barcode in (remove_barcodes or []):
+        bc = str(barcode or "").strip()
+        if bc:
+            removals.add(bc)
+
+    if _MODE == "connect":
+        sale_map = get_seasonal_sales_map()
+        for bc in removals:
+            sale_map.pop(bc, None)
+        sale_map.update(normalized)
+        response = _remote_post("/config/offers", {"seasonal_sales_map": sale_map})
+        saved = ((response or {}).get("config") or {}).get("seasonal_sales_map")
+        return saved if isinstance(saved, dict) else sale_map
+
+    cfg = _load_config()
+    sale_map = cfg.get("seasonal_sales_map") or {}
+    if not isinstance(sale_map, dict):
+        sale_map = {}
+    sale_map = dict(sale_map)
+    for bc in removals:
+        sale_map.pop(bc, None)
+    sale_map.update(normalized)
+    cfg["seasonal_sales_map"] = sale_map
+    _save_config(cfg)
+    _cloud_enqueue_config(_offers_config_payload())
+    return get_seasonal_sales_map()
+
+
 def remove_seasonal_sale_item(barcode: str) -> None:
     """Remove a barcode from the sale map."""
     set_seasonal_sale_item(barcode, 0.0)
